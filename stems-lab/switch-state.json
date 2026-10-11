@@ -1,0 +1,14 @@
+﻿{
+    "version":  1,
+    "targets":  [
+                    {
+                        "bin":  "C:\\Users\\Branko\\AppData\\Local\\AIR Music Technology\\EnginePrime\\bin",
+                        "vendorHash":  "e416e195bfe3aa0aafe0759ebdfb2ca8",
+                        "vendorSize":  415665168,
+                        "activeEngine":  "custom",
+                        "updatedUtc":  "2026-10-11T17:46:42.1435432Z",
+                        "customHash":  "0f9270fef64e903afb0df68ca0ec97fc",
+                        "customSize":  26624
+                    }
+                ]
+}

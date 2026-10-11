@@ -1,0 +1,21 @@
+{
+  "stems": {
+    "vocals": "C:\\Users\\Branko\\Desktop\\EnginePrime\\stems-lab\\engine\\stock\\20261009-235036\\vocals.wav",
+    "bass": "C:\\Users\\Branko\\Desktop\\EnginePrime\\stems-lab\\engine\\stock\\20261009-235036\\bass.wav",
+    "drums": "C:\\Users\\Branko\\Desktop\\EnginePrime\\stems-lab\\engine\\stock\\20261009-235036\\drums.wav",
+    "other": "C:\\Users\\Branko\\Desktop\\EnginePrime\\stems-lab\\engine\\stock\\20261009-235036\\other.wav"
+  },
+  "sample_rate": 44100,
+  "seconds": 193.747,
+  "frames": 8544256,
+  "peak": 1.2147,
+  "engine": "stock (Engine DJ's own stems processor; capture, not our engine)",
+  "source": "C:\\Users\\Branko\\Desktop\\EnginePrime\\Test 1 stems.m4a",
+  "capture": "C:\\Users\\Branko\\Desktop\\EnginePrime\\stems-lab\\tests\\pipe-trace\\20261009-235036\\stream-0x69bc.bin",
+  "order": [
+    "vocals",
+    "bass",
+    "drums",
+    "other"
+  ]
+}

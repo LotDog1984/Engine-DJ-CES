@@ -1,0 +1,30 @@
+# What engine/engine_service.py and separate.py need at runtime.
+#
+# The lab's own .venv is a throwaway (5.1 GB, machine-specific): rebuild it on any PC instead of
+# copying it. With 64-bit Python 3.12 (the version the lab was built with):
+#
+#   uv venv --python 3.12 .venv            (or:  py -3.12 -m venv .venv)
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# NVIDIA GPU - the wheels this lab currently uses, ~3 GB, installed over the CPU ones:
+#
+#   .venv\Scripts\python.exe -m pip install torch==2.11.0 torchaudio==2.11.0 ^
+#       --index-url https://download.pytorch.org/whl/cu128
+#   .venv\Scripts\python.exe -m pip install onnxruntime-gpu==1.30.0
+#
+# No NVIDIA GPU: nothing else changes - the engine selects the CPU by itself (see
+# README-ENGINE-SWITCH.md, "A PC with no NVIDIA GPU"). Use the CPU build of onnxruntime below.
+
+numpy==2.5.3
+soundfile==0.14.0
+torch==2.11.0
+torchaudio==2.11.0
+demucs==4.1.0
+audio-separator==0.47.0
+imageio-ffmpeg==0.6.0
+
+# audio-separator imports onnxruntime at module level even when a run only uses its torch-based
+# models (the lab's vocals_mel_band_roformer does). Install one of these two:
+#   onnxruntime==1.30.0        # CPU build - right choice when there is no NVIDIA driver
+#   onnxruntime-gpu==1.30.0    # what this lab has
+onnxruntime==1.30.0

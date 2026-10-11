@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stems payload probe</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 18px; font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; background: #14161a; color: #e8eaee; }
+  h1 { font: 600 15px/1.4 system-ui, sans-serif; }
+  pre { white-space: pre-wrap; background: #1b1f26; border: 1px solid #262a31; border-radius: 8px; padding: 12px; }
+  .ok { color: #7ad1a0; } .bad { color: #ff8f8f; }
+</style>
+</head>
+<body>
+<h1>Can this browser decode an Engine DJ <code>.stems</code> payload?</h1>
+<pre id="out">probing…</pre>
+<p style="color:#9aa3af">ffmpeg and faad both refuse these files (private element tags, prediction, channel config 0),
+for the stock engine's render exactly as for the custom one. This page is the last decoder on the PC:
+the browser's own (Media Foundation on Windows).</p>
+<script>
+const FILES = [
+  ["Test 1 - custom engine", "tests/stems-ab/test1-custom.stems"],
+  ["Test 2 - original engine", "tests/stems-ab/test2-original.stems"]
+];
+
+function probe(label, url) {
+  return new Promise((res) => {
+    const el = new Audio();
+    el.preload = "auto";
+    let settled = false;
+    const done = (state, extra) => {
+      if (settled) return;
+      settled = true;
+      res(Object.assign({ label, url, state }, extra));
+    };
+    el.addEventListener("loadedmetadata", () => done("metadata", { duration: el.duration }));
+    el.addEventListener("canplay", () => done("canplay", { duration: el.duration, readyState: el.readyState }));
+    el.addEventListener("error", () => done("error", {
+      code: el.error && el.error.code,
+      message: el.error && el.error.message
+    }));
+    setTimeout(() => done("timeout", { readyState: el.readyState, duration: el.duration }), 10000);
+    el.src = url;
+    el.load();
+  });
+}
+
+(async () => {
+  const lines = [];
+  const probeEl = new Audio();
+  lines.push("canPlayType audio/mp4; codecs=mp4a.40.2  -> " + JSON.stringify(probeEl.canPlayType('audio/mp4; codecs="mp4a.40.2"')));
+  lines.push("canPlayType audio/aac                    -> " + JSON.stringify(probeEl.canPlayType("audio/aac")));
+  for (const [label, url] of FILES) {
+    const r = await probe(label, url);
+    lines.push("");
+    lines.push(label + "  " + url);
+    lines.push("  state: " + r.state
+      + (r.duration !== undefined ? "   duration: " + r.duration : "")
+      + (r.code !== undefined ? "   code: " + r.code + "   message: " + r.message : ""));
+    lines.push("  " + (r.state === "canplay" || r.state === "metadata"
+      ? "PLAYABLE in this browser"
+      : "NOT playable in this browser"));
+  }
+  lines.push("");
+  lines.push("DONE");
+  document.getElementById("out").textContent = lines.join("\n");
+  window.__probe = { done: true, lines };
+})();
+</script>
+</body>
+</html>

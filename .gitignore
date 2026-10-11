@@ -1,0 +1,26 @@
+# Keep the repo from growing with runtime/by-products after the initial push.
+# Everything in stems-lab is deliberately included on day one.
+
+# Runtime artifacts the service and shim create - never source.
+*.log
+switch-log.txt
+engine/engine.port
+stems-lab/engine/engine.port
+stems-lab/engine/cache
+stems-lab/engine/sessions
+stems-lab/switch-app/selftest-report.txt
+
+# Python runtime and build artifacts.
+__pycache__
+*.pyc
+*.pyo
+.venv
+.ffmpeg
+
+# OS metadata.
+.DS_Store
+Thumbs.db
+
+# The venv's own ignore of itself.
+venv
+.env

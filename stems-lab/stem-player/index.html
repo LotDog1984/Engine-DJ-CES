@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stem auditioner</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: #14161a; color: #e8eaee; }
+  header { display: flex; gap: 12px; align-items: center; padding: 14px 16px; border-bottom: 1px solid #262a31; flex-wrap: wrap; }
+  h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; letter-spacing: .02em; }
+  select { background: #1e2229; color: inherit; border: 1px solid #2f3640; border-radius: 6px; padding: 6px 8px; max-width: 46ch; }
+  #meta { color: #9aa3af; font-size: 12px; }
+  main { padding: 8px 16px 4px; }
+  .row { display: grid; grid-template-columns: 90px 1fr 120px; gap: 10px; align-items: center; padding: 5px 0; }
+  .name { font-weight: 600; text-transform: capitalize; }
+  .bar { height: 16px; background: #1e2229; border-radius: 4px; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #3d7bfd, #7ad1a0); }
+  button { background: #1e2229; color: inherit; border: 1px solid #2f3640; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  button.on { background: #3d7bfd; border-color: #3d7bfd; color: #fff; }
+  button.solo.on { background: #d9a63c; border-color: #d9a63c; color: #221c0a; }
+  footer { display: flex; gap: 12px; align-items: center; padding: 12px 16px; border-top: 1px solid #262a31; flex-wrap: wrap; }
+  #play { min-width: 84px; font-weight: 600; }
+  input[type=range] { accent-color: #3d7bfd; }
+  #seek { flex: 1 1 220px; }
+  #time, #hint { color: #9aa3af; font-variant-numeric: tabular-nums; font-size: 12px; }
+  #hint { padding: 0 16px 14px; }
+  #renders { margin: 10px 16px 0; padding: 10px 12px; background: #1b1f26; border: 1px solid #262a31; border-radius: 8px; font-size: 12.5px; color: #cfd4dc; }
+  #renders b { color: #e8eaee; }
+  #renders a { color: #7ad1a0; }
+  #refs { margin: 10px 16px 0; padding: 10px 12px; background: #1b1f26; border: 1px solid #262a31; border-radius: 8px; font-size: 12.5px; color: #cfd4dc; }
+  #refs b { color: #e8eaee; }
+  #refs div.row2 { display: flex; gap: 10px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+  #refs audio { height: 30px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Stem auditioner</h1>
+  <select id="tracks"></select>
+  <span id="meta"></span>
+</header>
+
+<section id="renders" hidden></section>
+
+<section id="refs" hidden></section>
+
+<main id="stems"></main>
+
+<footer>
+  <button id="play">Play</button>
+  <input type="range" id="seek" min="0" max="1000" value="0" step="1">
+  <span id="time">0:00 / 0:00</span>
+  <label>master <input type="range" id="volume" min="0" max="100" value="80"></label>
+  <button id="unmute">unmute all</button>
+</footer>
+<p id="hint">All four stems play together, in sync — mute or solo any of them, exactly like the stems will behave on the player.</p>
+
+<script>
+const ORDER = ["vocals", "drums", "bass", "other"];
+const audio = {}, gain = {}, analyser = {}, level = {};
+let ctx = null, master = null, lead = null, tracks = [], solo = null, playing = false, driftTimer = null;
+
+const $ = (id) => document.getElementById(id);
+const fmt = (t) => {
+  if (!isFinite(t)) return "0:00";
+  const m = Math.floor(t / 60), s = Math.floor(t % 60);
+  return m + ":" + String(s).padStart(2, "0");
+};
+
+function buildUi() {
+  const host = $("stems");
+  for (const name of ORDER) {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `<span class="name">${name}</span>
+      <span class="bar"><i id="lvl-${name}"></i></span>
+      <span><button id="mute-${name}">mute</button> <button class="solo" id="solo-${name}">solo</button></span>`;
+    host.appendChild(row);
+    $("mute-" + name).onclick = () => { audio[name].dataset.muted = audio[name].dataset.muted === "1" ? "" : "1"; solo = null; applyMix(); };
+    $("solo-" + name).onclick = () => { solo = solo === name ? null : name; applyMix(); };
+  }
+  $("unmute").onclick = () => { solo = null; ORDER.forEach((n) => { audio[n].dataset.muted = ""; }); applyMix(); };
+}
+
+function ensureGraph() {
+  if (ctx) return;
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  master = ctx.createGain();
+  master.gain.value = 0.8;
+  master.connect(ctx.destination);
+  for (const name of ORDER) {
+    const el = new Audio();
+    el.preload = "auto";
+    el.crossOrigin = "anonymous";
+    // MediaElementSource routes the element through WebAudio so we can meter and fade it.
+    const src = ctx.createMediaElementSource(el);
+    const g = ctx.createGain();
+    const a = ctx.createAnalyser();
+    a.fftSize = 2048;
+    src.connect(g); g.connect(a); a.connect(master);
+    audio[name] = el; gain[name] = g; analyser[name] = a;
+    level[name] = new Uint8Array(a.fftSize);
+  }
+  lead = audio.vocals;
+  lead.addEventListener("ended", stop);
+  lead.addEventListener("loadedmetadata", paint);
+  lead.addEventListener("durationchange", paint);
+  lead.addEventListener("timeupdate", () => { if (!seeking) $("seek").value = String(Math.round(1000 * (lead.currentTime / (lead.duration || 1)))); paint(); });
+  metre();
+}
+
+function applyMix() {
+  // Solo wins over mute, exactly like a mixer: if anything is soloed only that stem is heard.
+  for (const name of ORDER) {
+    const m = audio[name].dataset.muted === "1";
+    const s = solo === name;
+    const audible = solo ? s : !m;
+    gain[name].gain.value = audible ? 1 : 0;
+    $("mute-" + name).classList.toggle("on", m);
+    $("solo-" + name).classList.toggle("on", s);
+  }
+}
+
+function load(index) {
+  ensureGraph();
+  stop();
+  const t = tracks[index];
+  for (const name of ORDER) {
+    audio[name].src = t.stems[name];
+    audio[name].dataset.muted = "";
+    audio[name].dataset.solo = "";
+  }
+  solo = null;
+  $("meta").textContent = (t.label ? t.label + " · " : "")
+    + `${t.seconds ? t.seconds.toFixed(1) + " s" : ""} · separated ${t.created}`
+    + (t.realtime_factor ? ` · ${t.realtime_factor}× realtime` : "") + ` · ${t.key}`;
+  applyMix();
+  paint();
+}
+
+function play() {
+  ensureGraph();
+  if (ctx.state === "suspended") ctx.resume();
+  const t0 = lead.currentTime || 0;
+  for (const name of ORDER) {
+    try { audio[name].currentTime = t0; } catch (e) { /* not seekable yet */ }
+    const p = audio[name].play();
+    if (p && p.catch) p.catch(() => {});
+  }
+  playing = true;
+  $("play").textContent = "Pause";
+  clearInterval(driftTimer);
+  // Keep the four in step: correct any stem that wanders more than 60 ms.
+  driftTimer = setInterval(() => {
+    if (!playing) return;
+    for (const name of ORDER) {
+      const el = audio[name];
+      if (el.seeking || !isFinite(el.duration)) continue;
+      const d = el.currentTime - lead.currentTime;
+      if (Math.abs(d) > 0.06) el.currentTime = lead.currentTime;
+    }
+  }, 300);
+}
+
+function stop() {
+  playing = false;
+  clearInterval(driftTimer);
+  for (const name of ORDER) { try { audio[name] && audio[name].pause(); } catch (e) {} }
+  $("play").textContent = "Play";
+}
+
+function paint() {
+  const d = lead && isFinite(lead.duration) ? lead.duration : 0;
+  $("time").textContent = `${fmt(lead ? lead.currentTime : 0)} / ${fmt(d)}`;
+}
+
+let seeking = false;
+function metre() {
+  requestAnimationFrame(metre);
+  for (const name of ORDER) {
+    const a = analyser[name];
+    if (!a) continue;
+    a.getByteTimeDomainData(level[name]);
+    let sum = 0;
+    for (let i = 0; i < level[name].length; i++) { const v = (level[name][i] - 128) / 128; sum += v * v; }
+    const rms = Math.sqrt(sum / level[name].length);
+    const pct = Math.min(100, Math.round(rms * 320 * gain[name].gain.value));
+    $("lvl-" + name).style.width = pct + "%";
+  }
+  if (playing) paint();
+}
+
+$("play").onclick = () => (playing ? stop() : play());
+$("seek").oninput = () => {
+  seeking = true;
+  const f = Number($("seek").value) / 1000;
+  for (const name of ORDER) { try { audio[name].currentTime = f * (lead.duration || 0); } catch (e) {} }
+  paint();
+};
+$("seek").onchange = () => { seeking = false; };
+$("volume").oninput = () => { ensureGraph(); master.gain.value = Number($("volume").value) / 100; };
+document.addEventListener("keydown", (e) => {
+  if (e.code === "Space") { e.preventDefault(); playing ? stop() : play(); }
+});
+
+// The app's own .stems files cannot be decoded by this browser (probe.html shows the same for
+// ffmpeg and faad), so they are listed with that verdict rather than silently missing.
+function paintRenders(rows) {
+  if (!rows || !rows.length) return;
+  const box = $("renders");
+  box.hidden = false;
+  box.innerHTML = "<b>Engine DJ renders (raw .stems)</b>" + rows.map((r) =>
+    `<div>${r.label} · ${(r.bytes / 1048576).toFixed(1)} MB · <a href="${r.url}">file</a> — not playable here</div>`).join("")
+    + `<div style="color:#9aa3af;margin-top:6px">${rows[0].note} <a href="/stem-player/probe.html">decoder probe</a></div>`;
+}
+
+// The app's own stream and the source it came from, kept as WAVs so the pitch question can be
+// settled by ear here rather than on the device.
+function paintReferences(rows) {
+  if (!rows || !rows.length) return;
+  const box = $("refs");
+  box.hidden = false;
+  box.innerHTML = "<b>Reference audio</b> — both are the same track; listen for the octave"
+    + rows.map((r) => `<div class="row2"><span>${r.label} · ${r.mb} MB</span>`
+        + `<audio controls preload="none" src="${r.url}"></audio></div>`).join("");
+}
+
+(async function init() {
+  buildUi();
+  const [tracksJson, rendersJson, referencesJson] = await Promise.all([
+    fetch("/api/tracks").then((r) => r.json()),
+    fetch("/api/renders").then((r) => r.json()).catch(() => []),
+    fetch("/api/references").then((r) => r.json()).catch(() => []),
+  ]);
+  tracks = tracksJson;
+  paintRenders(rendersJson);
+  paintReferences(referencesJson);
+  if (!tracks.length) { $("meta").textContent = "no separated tracks in the cache yet"; return; }
+  $("tracks").innerHTML = tracks.map((t, i) =>
+    `<option value="${i}">${t.label ? t.label + " · " : ""}${t.seconds ? t.seconds.toFixed(1) + " s" : t.key} — ${t.created}</option>`).join("");
+  $("tracks").onchange = () => load(Number($("tracks").value));
+  load(0);
+})();
+</script>
+</body>
+</html>
