@@ -24,3 +24,21 @@ Thumbs.db
 # The venv's own ignore of itself.
 venv
 .env
+
+# Downloaded at first run by the switch app's "Set up Custom Engine" button, or produced by
+# the test runs. Rebuildable from requirements.txt / the model host, so never committed:
+#   models/          the 913 MB vocal model (audio-separator fetches it)
+#   bin/             the stock stems-processor.exe reference copy (~400 MB)
+#   engine/references, engine/stock   separation output kept for comparison
+stems-lab/models/
+bin/
+stems-lab/engine/references/
+stems-lab/engine/stock/
+
+# uv is fetched from GitHub releases beside the app when it is missing, then unpacked.
+uv.exe
+_uv_extract/
+_uv_download.zip
+
+# Logs written by a headless setup run.
+setup-log*.txt

@@ -22,8 +22,37 @@ Options in the window:
 * **Force** — only needed if you want to switch while Engine DJ is still open.
 * **Refresh** — re-reads the state.
 
+There is also a **Set up Custom Engine (first run)** button along the top. A fresh clone is
+deliberately small — no venv, no model, no ffmpeg binary — so the CUSTOM button has nothing to
+run until the Python side exists. This one button builds all of it:
+
+1. finds `uv` (beside the app, on `PATH`, or in the venv) and downloads the standalone
+   `uv.exe` from Astral's GitHub releases if it is nowhere to be found;
+2. makes sure Python 3.12 is available (`uv python install 3.12`);
+3. rebuilds `.venv` from `requirements.txt` (`uv venv` + `pip install`);
+4. downloads the vocal model with `audio-separator --download_model_only`;
+5. recreates `.ffmpeg\ffmpeg.exe` through `separate.ensure_ffmpeg()`;
+6. pre-warms the demucs `htdemucs_ft` weights so the first real separation does not stall.
+
+Every step is streamed into the log panel with what it is doing and why it failed, and the
+whole run is safe to repeat — anything already installed is detected and skipped. When it
+finishes it says **all set up** and leaves the engine choice to you: press **Use CUSTOM stems**
+to switch, or **Use ORIGINAL stems** to stay on the stock processor. It never flips the engine
+by itself.
+
+The same setup without a window, for scripting a fresh clone:
+
+```
+switch-app\StemsEngineSwitch.exe --setup                  # log to stdout
+switch-app\StemsEngineSwitch.exe --setup setup-log.txt    # and write it to a file
+```
+
+`--setup` exits `0` when everything is ready and `1` when a step failed.
+
 The app is a front end for `engine-switch.ps1` below: every button runs that script and
-shows its output, so the tested logic is the only thing that touches files.
+shows its output, so the tested logic is the only thing that touches files. (The setup button is
+the exception — it is this binary's own code, because upgrading a venv is not something the
+switch script does.)
 
 ## The same thing from a terminal
 
@@ -178,7 +207,14 @@ with `-Engine custom`; `-Status` prints the new hash.
 
 Nothing in this repo is pinned to this machine. A fresh clone is small on purpose — the big
 model, the ffmpeg binary and the reference captures are not in it, because they either rebuild
-or download on first use. What you do once:
+or download on first use.
+
+**The short way:** run the switch app and press **Set up Custom Engine (first run)**. It does
+everything below for you — uv, Python 3.12, the venv, the model, ffmpeg, the demucs weights —
+and tells you when it is done so you can pick an engine. The rest of this section is the manual
+equivalent, which is what the button runs.
+
+What it does, once:
 
 1. **Rebuild the venv.** The included `.venv` is deliberately not in the repo (it is 5 GB of
    machine-specific binaries with absolute paths). Rebuild it with 64-bit Python 3.12, the
