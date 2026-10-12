@@ -29,10 +29,16 @@ run until the Python side exists. This one button builds all of it:
 1. finds `uv` (beside the app, on `PATH`, or in the venv) and downloads the standalone
    `uv.exe` from Astral's GitHub releases if it is nowhere to be found;
 2. makes sure Python 3.12 is available (`uv python install 3.12`);
-3. rebuilds `.venv` from `requirements.txt` (`uv venv` + `pip install`);
-4. downloads the vocal model with `audio-separator --download_model_only`;
-5. recreates `.ffmpeg\ffmpeg.exe` through `separate.ensure_ffmpeg()`;
-6. pre-warms the demucs `htdemucs_ft` weights so the first real separation does not stall.
+3. rebuilds `.venv` from `requirements.txt` (`uv venv --seed` + `pip install`. The `--seed`
+   is what puts pip inside the venv - a plain `uv venv` has none, and the install after it
+   would stop with "No module named pip");
+4. recreates `.ffmpeg\ffmpeg.exe` through `separate.ensure_ffmpeg()`, **before** the model
+   step, because `audio-separator` raises if it cannot find `ffmpeg` on `PATH`;
+5. checks the installed stack actually imports (`python -c "import ... audio_separator.separator"`)
+   and names the missing module if it does not — a venv can install cleanly and still be
+   unusable, and finding that out before the 900 MB download is worth one extra step;
+6. downloads the vocal model with `audio-separator --download_model_only`;
+7. pre-warms the demucs `htdemucs_ft` weights so the first real separation does not stall.
 
 Every step is streamed into the log panel with what it is doing and why it failed, and the
 whole run is safe to repeat — anything already installed is detected and skipped. When it
@@ -143,6 +149,12 @@ The binary is rebuilt from `shim\StemsShim.cs` (see "Rebuilding"); install it wi
   `.stems` files, so switching engines will not re-separate them on its own. Whether the app
   re-runs or skips them is decided by its database (`m.db` / `stm.db`), which the switch
   deliberately does not touch.
+* **The demucs stage is not bit-reproducible, so do not compare stem files by hash.** Two runs
+  of the same install on the same machine produce stem bytes that differ by a few percent
+  (measured: ~4–10% RMS on drums/bass/other, ~0.1–1.3% on stem energy, correlation 0.997+),
+  because CPU convolutions and their reductions are not deterministic and the CUDA path differs
+  from the CPU one again. The vocals stage *is* deterministic and bit-identical. Compare
+  energies, correlations or how a stem sounds, not the bytes.
 * **The stdio protocol is reproduced from measurements, so a changed host would break it.**
   Both directions are planar float32, `action=block` / `action=done` / `returnFrames` /
   `done=true`, with the four stems in 8 channels as vocals, bass, drums, other — all of it read
@@ -221,13 +233,22 @@ What it does, once:
    version this lab was built with:
 
    ```
-   uv venv --python 3.12 .venv          # or: py -3.12 -m venv .venv
+   uv venv --seed --python 3.12 .venv   # or: py -3.12 -m venv .venv, which includes pip
    .venv\Scripts\python.exe -m pip install -r requirements.txt
    ```
+
+   `--seed` is not optional: a plain `uv venv` contains no pip, so the second line fails with
+   "No module named pip".
 
    That installs everything the service and `separate.py` need: numpy, soundfile, torch,
    torchaudio, demucs, audio-separator, imageio-ffmpeg and onnxruntime. All versions in
    `requirements.txt` are pinned and real on PyPI.
+
+   `audioread` is pinned there for a reason: `audio-separator` imports it at module level and
+   does not declare it, and `librosa` 1.0 — which it does depend on — stopped bringing it in.
+   Without that pin the install succeeds and then every `audio-separator` command dies with
+   `ModuleNotFoundError: No module named 'audioread'`. After the install you can check it in one
+   line: `.venv\Scripts\python.exe -c "import audio_separator.separator"`.
 
 2. **First separation pulls in the rest automatically.** The first time a track is separated:
 

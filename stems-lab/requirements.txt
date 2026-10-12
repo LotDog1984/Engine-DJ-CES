@@ -3,8 +3,11 @@
 # The lab's own .venv is a throwaway (5.1 GB, machine-specific): rebuild it on any PC instead of
 # copying it. With 64-bit Python 3.12 (the version the lab was built with):
 #
-#   uv venv --python 3.12 .venv            (or:  py -3.12 -m venv .venv)
+#   uv venv --seed --python 3.12 .venv     (or:  py -3.12 -m venv .venv)
 #   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# --seed is what puts pip into the venv: a plain `uv venv` has no pip, so the line after it
+# fails with "No module named pip". `py -3.12 -m venv` includes pip already.
 #
 # NVIDIA GPU - the wheels this lab currently uses, ~3 GB, installed over the CPU ones:
 #
@@ -22,6 +25,12 @@ torchaudio==2.11.0
 demucs==4.1.0
 audio-separator==0.47.0
 imageio-ffmpeg==0.6.0
+
+# audio-separator imports audioread at module level (uvr_lib_v5/spec_utils.py) but does not
+# declare it, and librosa 1.0 - which it does declare - no longer depends on it. Without this
+# pin a fresh venv installs cleanly and then cannot `import audio_separator.separator` at all,
+# so the model download never starts.
+audioread==3.1.0
 
 # audio-separator imports onnxruntime at module level even when a run only uses its torch-based
 # models (the lab's vocals_mel_band_roformer does). Install one of these two:

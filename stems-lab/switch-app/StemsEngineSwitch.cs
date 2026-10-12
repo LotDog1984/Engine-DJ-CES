@@ -473,7 +473,10 @@ class MainForm : Form
             if (!Directory.Exists(venv) || !File.Exists(pythonExe))
             {
                 log("creating .venv with uv...");
-                if (!Run(uvExe, null, log, "venv", "--python", "3.12", ".venv", labDir))
+                // --seed is what puts pip inside the venv (uv leaves it out by default, and the
+                // next step runs `python -m pip install`). The path is absolute so the venv lands
+                // in the lab whatever directory the app was started from.
+                if (!Run(uvExe, labDir, log, "venv", "--seed", "--python", "3.12", venv))
                 {
                     log("FAILED to create .venv");
                     failed = true;
@@ -494,7 +497,41 @@ class MainForm : Form
             }
         }
 
-        // ---- 4. the vocal model ----
+        // ---- 4. ffmpeg, before anything that imports audio-separator ----
+        // audio-separator's constructor runs `ffmpeg -version` and raises when it cannot find
+        // it, and a fresh clone has no .ffmpeg directory, so this has to happen before the
+        // model step. Same call the service makes, from the imageio-ffmpeg cache pip just
+        // installed.
+        if (!failed && File.Exists(pythonExe))
+        {
+            log("recreating .ffmpeg\\ffmpeg.exe...");
+            // separate.py sits at the lab root and is imported the same way the engine service
+            // imports it (lab root on sys.path), so mirror that here.
+            if (!Run(pythonExe, labDir, log, "-c",
+                     "import sys, os; sys.path.insert(0, os.getcwd()); import separate; separate.ensure_ffmpeg()"))
+                log("WARNING: ffmpeg could not be recreated now - the service will try again on first use");
+            else log("ffmpeg ready");
+        }
+
+        // ---- 5. do the engine's modules actually import? ----
+        // A venv can install cleanly and still be unusable: audio-separator imports packages it
+        // does not declare (audioread, see requirements.txt). Checking here names the missing
+        // module straight away instead of failing after the 900 MB model download.
+        if (!failed && File.Exists(pythonExe))
+        {
+            log("checking that the installed stack imports...");
+            if (!Run(pythonExe, labDir, log, "-c",
+                     "import numpy, soundfile, torch, torchaudio, onnxruntime; "
+                     + "import demucs.api, audio_separator.separator; "
+                     + "print('imports ok - torch ' + torch.__version__)"))
+            {
+                log("FAILED to import the engine's modules - the missing module is named above");
+                failed = true;
+            }
+            else log("imports ok");
+        }
+
+        // ---- 6. the vocal model ----
         if (!failed)
         {
             string audioSep = Path.Combine(venv, "Scripts", "audio-separator.exe");
@@ -508,8 +545,9 @@ class MainForm : Form
                 {
                     log("downloading vocals_mel_band_roformer.ckpt (~900 MB via audio-separator)...");
 
-                    // audio-separator wants ffmpeg on PATH. imageio-ffmpeg is installed by the
-                    // step above; put the lab's own copy in front of PATH for this child only.
+                    // audio-separator shells out to a bare `ffmpeg`, so its DIRECTORY has to be
+                    // on PATH for this child - putting the .exe path itself in PATH does not
+                    // help Windows find it. The lab's copy is step 4 above.
                     var env = new Dictionary<string, string>();
                     System.Collections.IDictionary current = Environment.GetEnvironmentVariables();
                     foreach (System.Collections.DictionaryEntry kv in current)
@@ -518,9 +556,11 @@ class MainForm : Form
                         string v = kv.Value as string;
                         if (k != null && v != null) env[k] = v;
                     }
-                    string ffmpeg = Path.Combine(labDir, ".ffmpeg", "ffmpeg.exe");
-                    if (File.Exists(ffmpeg) && env.ContainsKey("PATH"))
-                        env["PATH"] = ffmpeg + ";" + env["PATH"];
+                    string ffmpegDir = Path.Combine(labDir, ".ffmpeg");
+                    if (File.Exists(Path.Combine(ffmpegDir, "ffmpeg.exe")))
+                        PrependToPath(env, ffmpegDir);
+                    else
+                        log("WARNING: no .ffmpeg\\ffmpeg.exe yet - audio-separator may refuse to start");
 
                     if (!RunWithEnv(audioSep, labDir, log, env,
                                     "--model_filename", "vocals_mel_band_roformer.ckpt",
@@ -536,19 +576,7 @@ class MainForm : Form
             else log("WARNING: audio-separator.exe is missing after pip install - model step skipped");
         }
 
-        // ---- 5. ffmpeg (recreated from the imageio-ffmpeg cache, same call the service makes) ----
-        if (!failed && File.Exists(pythonExe))
-        {
-            log("recreating .ffmpeg\\ffmpeg.exe...");
-            // separate.py sits at the lab root and is imported the same way the engine service
-            // imports it (lab root on sys.path), so mirror that here.
-            if (!Run(pythonExe, labDir, log, "-c",
-                     "import sys, os; sys.path.insert(0, os.getcwd()); import separate; separate.ensure_ffmpeg()"))
-                log("WARNING: ffmpeg could not be recreated now - the service will try again on first use");
-            else log("ffmpeg ready");
-        }
-
-        // ---- 6. demucs weights, so the first real separation does not stop to download ----
+        // ---- 7. demucs weights, so the first real separation does not stop to download ----
         if (!failed && File.Exists(pythonExe))
         {
             log("pre-fetching the demucs htdemucs_ft weights...");
@@ -579,6 +607,21 @@ class MainForm : Form
         string inVenv = Path.Combine(labDir, ".venv", "Scripts", fileName);
         if (File.Exists(inVenv)) return inVenv;
         return null;
+    }
+
+    // Put a directory in front of a child process's PATH. The existing key is looked up rather
+    // than assumed because the parent's spelling (Path vs PATH) is not fixed.
+    static void PrependToPath(System.Collections.IDictionary env, string dir)
+    {
+        string key = null;
+        foreach (System.Collections.DictionaryEntry kv in env)
+        {
+            string k = kv.Key as string;
+            if (k != null && k.Equals("PATH", StringComparison.OrdinalIgnoreCase)) { key = k; break; }
+        }
+        // ProcessStartInfo.EnvironmentVariables is case-insensitive on Windows, so writing
+        // "PATH" updates whichever spelling the parent used.
+        env["PATH"] = (key != null) ? dir + ";" + env[key] : dir;
     }
 
     static bool TryFindOnPath(string name, out string foundPath)
