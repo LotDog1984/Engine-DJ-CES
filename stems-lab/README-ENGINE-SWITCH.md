@@ -32,13 +32,16 @@ run until the Python side exists. This one button builds all of it:
 3. rebuilds `.venv` from `requirements.txt` (`uv venv --seed` + `pip install`. The `--seed`
    is what puts pip inside the venv - a plain `uv venv` has none, and the install after it
    would stop with "No module named pip");
-4. recreates `.ffmpeg\ffmpeg.exe` through `separate.ensure_ffmpeg()`, **before** the model
+4. installs the CUDA build of `torch`/`torchaudio` when the machine has an NVIDIA GPU (it asks
+   `nvidia-smi`), and leaves the CPU build alone when it does not. The swap needs
+   `--force-reinstall`: `2.11.0+cpu` satisfies `torch==2.11.0`, so a plain install does nothing;
+5. recreates `.ffmpeg\ffmpeg.exe` through `separate.ensure_ffmpeg()`, **before** the model
    step, because `audio-separator` raises if it cannot find `ffmpeg` on `PATH`;
-5. checks the installed stack actually imports (`python -c "import ... audio_separator.separator"`)
+6. checks the installed stack actually imports (`python -c "import ... audio_separator.separator"`)
    and names the missing module if it does not — a venv can install cleanly and still be
    unusable, and finding that out before the 900 MB download is worth one extra step;
-6. downloads the vocal model with `audio-separator --download_model_only`;
-7. pre-warms the demucs `htdemucs_ft` weights so the first real separation does not stall.
+7. downloads the vocal model with `audio-separator --download_model_only`;
+8. pre-warms the demucs `htdemucs_ft` weights so the first real separation does not stall.
 
 Every step is streamed into the log panel with what it is doing and why it failed, and the
 whole run is safe to repeat — anything already installed is detected and skipped. When it
@@ -264,11 +267,22 @@ What it does, once:
    torchaudio, demucs, audio-separator, imageio-ffmpeg and onnxruntime. All versions in
    `requirements.txt` are pinned and real on PyPI.
 
-   One caveat that matters for speed: `pip install -r requirements.txt` gets the **CPU** torch
-   build, because that is what PyPI serves. On a machine with an NVIDIA GPU the cu128 wheels in
-   the same file are worth the ~3 GB - expect roughly 2x realtime on CPU (a 3-minute track took
-   about 7 minutes here) against several times faster on the GPU. The service picks the device
-   itself once torch can see it.
+   Step 4 of the button is what decides how fast everything after it runs. `pip install -r
+   requirements.txt` gets the **CPU** torch build, because that is what PyPI serves; on a machine
+   with an NVIDIA GPU the button replaces it with the CUDA build (about 3 GB, once - `STEMS_TORCH=cpu`
+   skips that), and on one without a GPU it leaves the CPU build alone. Either way the device is
+   chosen at run time from `torch.cuda.is_available()`, so a CUDA build on a GPU-less machine
+   simply runs on the CPU.
+
+   Measured here on the same 30 s of a real mix, same models, on both builds:
+
+   | | device | time | realtime |
+   |---|---|---|---|
+   | CPU build | `cpu` | 59.4 s | 1.98x |
+   | CUDA build | `cuda` | **9.8 s** | 0.33x |
+
+   For scale: the 191 s track that the CPU build made look stuck took 435 s (2.27x); the same
+   work is around 70 s on the GPU.
 
    `audioread` is pinned there for a reason: `audio-separator` imports it at module level and
    does not declare it, and `librosa` 1.0 — which it does depend on — stopped bringing it in.
@@ -318,8 +332,11 @@ that ran.
   which is what makes it choose the CPU. (`-1`, not an empty string: an empty value leaves torch
   claiming CUDA exists with zero devices, which crashes that stage's device probe instead of
   falling back.)
-* Install the CPU build from `requirements.txt` (`onnxruntime==1.30.0`). The CUDA torch wheels
-  do work on a CPU-only machine, they are just about 3 GB larger than they need to be.
+* Install the CPU build from `requirements.txt` (`onnxruntime==1.30.0`). The setup button does
+  exactly that on a machine with no NVIDIA driver, because it checks for `nvidia-smi` first. A
+  CUDA build that is already there is not a problem either: the engine asks
+  `torch.cuda.is_available()`, gets `False`, and runs on the CPU — it is just about 3 GB larger
+  than it needed to be.
 
 ## What is in the repo
 

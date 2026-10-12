@@ -9,10 +9,20 @@
 # --seed is what puts pip into the venv: a plain `uv venv` has no pip, so the line after it
 # fails with "No module named pip". `py -3.12 -m venv` includes pip already.
 #
-# NVIDIA GPU - the wheels this lab currently uses, ~3 GB, installed over the CPU ones:
+# NVIDIA GPU - the wheels this lab currently uses, ~3 GB, installed over the CPU ones. The
+# setup button runs the torch line below by itself when it finds an NVIDIA GPU (it asks
+# nvidia-smi), and leaves the CPU build in place when it does not, so this is the manual
+# equivalent of what it already did. A CUDA build on a machine without a GPU is harmless too:
+# the engine asks torch.cuda.is_available() and runs on the CPU.
 #
-#   .venv\Scripts\python.exe -m pip install torch==2.11.0 torchaudio==2.11.0 ^
-#       --index-url https://download.pytorch.org/whl/cu128
+#   .venv\Scripts\python.exe -m pip install --force-reinstall --no-deps ^
+#       torch==2.11.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+#
+# --force-reinstall is required once the CPU build is installed: 2.11.0+cpu satisfies
+# `torch==2.11.0`, so pip would answer "already satisfied" and install nothing at all (that is
+# how this command used to behave). --no-deps keeps the CUDA index from having to answer for
+# filelock, sympy and the rest - on Windows the CUDA runtime is inside the wheel, and the
+# working GPU venv here has no nvidia-* packages whatsoever.
 #   .venv\Scripts\python.exe -m pip install onnxruntime-gpu==1.30.0
 #
 # No NVIDIA GPU: nothing else changes - the engine selects the CPU by itself (see

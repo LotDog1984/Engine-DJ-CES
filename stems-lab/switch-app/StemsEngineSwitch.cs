@@ -497,7 +497,61 @@ class MainForm : Form
             }
         }
 
-        // ---- 4. ffmpeg, before anything that imports audio-separator ----
+        // ---- 4. the torch build this machine can use ----
+        // Step 3 installs the CPU build, because that is what PyPI serves. On a machine with an
+        // NVIDIA driver the CUDA build is several times faster, and on one without a GPU the
+        // engine still picks the CPU by itself (the service asks torch.cuda.is_available()), so
+        // matching the build to the machine costs nothing but the one-off download.
+        // STEMS_TORCH=cpu skips the install; the default (auto) installs only when a GPU is here.
+        if (!failed && File.Exists(pythonExe))
+        {
+            string want = (Environment.GetEnvironmentVariable("STEMS_TORCH") ?? "").Trim().ToLowerInvariant();
+            string build = TorchBuildInfo(pythonExe, labDir);
+            string buildNote = build != null ? " (" + build + ")" : "";
+            bool cudaBuild = build != null && build.IndexOf("cuda_build=True", StringComparison.Ordinal) >= 0;
+            string gpu = want == "cpu" ? null : NvidiaGpuName();
+
+            if (want == "cpu")
+                log("torch: STEMS_TORCH=cpu - leaving the installed build alone" + buildNote + ", the engine will select the CPU");
+            else if (gpu == null)
+                log("torch: no NVIDIA GPU detected - the CPU build is the right one here" + buildNote + ", and the engine selects the CPU by itself");
+            else if (cudaBuild)
+                log("torch: already the CUDA build for " + gpu + buildNote);
+            else
+            {
+                log("torch: NVIDIA GPU detected (" + gpu + ") - installing the CUDA build of torch and torchaudio (~3 GB, once)");
+                // --force-reinstall is what makes this work at all: pip treats the installed
+                // 2.11.0+cpu as satisfying `torch==2.11.0` and would otherwise do nothing.
+                // --no-deps keeps the CUDA index (torch, torchvision, torchaudio, the CUDA
+                // wheels) from having to answer for filelock, sympy and the rest; on Windows
+                // the CUDA runtime is inside the wheel.
+                if (!Run(pythonExe, labDir, log, "-m", "pip", "install", "--force-reinstall", "--no-deps",
+                         "torch==2.11.0", "torchaudio==2.11.0",
+                         "--index-url", "https://download.pytorch.org/whl/cu128"))
+                    log("WARNING: the CUDA build did not install - the CPU build stays, the engine still works, just slower");
+                else
+                {
+                    build = TorchBuildInfo(pythonExe, labDir);
+                    if (build == null)
+                    {
+                        // A speed upgrade must never leave the engine unable to import torch.
+                        log("WARNING: torch does not import after the CUDA install - putting the CPU build back");
+                        if (Run(pythonExe, labDir, log, "-m", "pip", "install", "--force-reinstall", "--no-deps",
+                                "torch==2.11.0", "torchaudio==2.11.0"))
+                        {
+                            build = TorchBuildInfo(pythonExe, labDir);
+                            log("torch: back to " + (build ?? "a state torch cannot import - reinstall requirements.txt"));
+                        }
+                    }
+                    else if (build.IndexOf("cuda_available=True", StringComparison.Ordinal) < 0)
+                        log("WARNING: the CUDA build is installed but torch cannot see the GPU (driver too old?) - the engine will fall back to the CPU");
+                    else
+                        log("torch: the engine will use the GPU (" + build + ")");
+                }
+            }
+        }
+
+        // ---- 5. ffmpeg, before anything that imports audio-separator ----
         // audio-separator's constructor runs `ffmpeg -version` and raises when it cannot find
         // it, and a fresh clone has no .ffmpeg directory, so this has to happen before the
         // model step. Same call the service makes, from the imageio-ffmpeg cache pip just
@@ -513,7 +567,7 @@ class MainForm : Form
             else log("ffmpeg ready");
         }
 
-        // ---- 5. do the engine's modules actually import? ----
+        // ---- 6. do the engine's modules actually import? ----
         // A venv can install cleanly and still be unusable: audio-separator imports packages it
         // does not declare (audioread, see requirements.txt). Checking here names the missing
         // module straight away instead of failing after the 900 MB model download.
@@ -531,7 +585,7 @@ class MainForm : Form
             else log("imports ok");
         }
 
-        // ---- 6. the vocal model ----
+        // ---- 7. the vocal model ----
         if (!failed)
         {
             string audioSep = Path.Combine(venv, "Scripts", "audio-separator.exe");
@@ -576,7 +630,7 @@ class MainForm : Form
             else log("WARNING: audio-separator.exe is missing after pip install - model step skipped");
         }
 
-        // ---- 7. demucs weights, so the first real separation does not stop to download ----
+        // ---- 8. demucs weights, so the first real separation does not stop to download ----
         if (!failed && File.Exists(pythonExe))
         {
             log("pre-fetching the demucs htdemucs_ft weights...");
@@ -607,6 +661,73 @@ class MainForm : Form
         string inVenv = Path.Combine(labDir, ".venv", "Scripts", fileName);
         if (File.Exists(inVenv)) return inVenv;
         return null;
+    }
+
+    // The GPU name when this machine has a working NVIDIA driver, else null. nvidia-smi ships
+    // with the driver (System32 on current versions, the NVSMI folder on older ones), so its
+    // presence plus a successful query is the same thing as "the engine could use this GPU".
+    static string NvidiaGpuName()
+    {
+        string[] candidates = new string[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "nvidia-smi.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                         "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe"),
+        };
+        foreach (string exe in candidates)
+        {
+            string name = RunCapture(exe, null, "--query-gpu=name", "--format=csv,noheader");
+            if (!string.IsNullOrEmpty(name))
+            {
+                string first = SplitLines(name).FirstOrDefault();
+                if (!string.IsNullOrEmpty(first)) return first.Trim();
+            }
+        }
+        return null;
+    }
+
+    // One line from the venv's torch: version plus whether it is a CUDA build and whether it can
+    // see a GPU. A CPU build reports cuda_build=False, which is what tells the two apart.
+    // null when torch is not importable (nothing installed yet).
+    static string TorchBuildInfo(string pythonExe, string labDir)
+    {
+        string text = RunCapture(pythonExe, labDir, "-c",
+            "import torch; print('%s cuda_build=%s cuda_available=%s' "
+            + "% (torch.__version__, torch.version.cuda is not None, torch.cuda.is_available()))");
+        if (string.IsNullOrEmpty(text)) return null;
+        string first = SplitLines(text).FirstOrDefault();
+        return string.IsNullOrEmpty(first) ? null : first.Trim();
+    }
+
+    // Run something small and read what it printed: probes answer with output rather than with a
+    // log to show, so this returns null for "it failed" instead of writing lines into the panel.
+    static string RunCapture(string exe, string workingDir, params string[] args)
+    {
+        if (exe == null || !File.Exists(exe)) return null;
+        var psi = new ProcessStartInfo();
+        psi.FileName = exe;
+        psi.Arguments = string.Join(" ", args.Select(EscapeArg).ToArray());
+        psi.WorkingDirectory = workingDir;
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        try
+        {
+            using (var p = Process.Start(psi))
+            {
+                if (p == null) return null;
+                Task<string> errTask = p.StandardError.ReadToEndAsync();
+                string text = p.StandardOutput.ReadToEnd();
+                p.WaitForExit();
+                errTask.Wait();
+                return p.ExitCode == 0 ? text : null;
+            }
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     // Put a directory in front of a child process's PATH. The existing key is looked up rather
