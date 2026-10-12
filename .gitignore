@@ -42,3 +42,6 @@ _uv_download.zip
 
 # Logs written by a headless setup run.
 setup-log*.txt
+
+# Scratch directory tests/test-engine-switch.ps1 builds and leaves behind.
+stems-lab/tests/sandbox/

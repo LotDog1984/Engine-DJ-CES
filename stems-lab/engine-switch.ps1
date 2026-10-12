@@ -175,6 +175,32 @@ function App-Running {
     return $running
 }
 
+# Engine DJ spawns stems-processor.exe and exits without always taking it with it, so an
+# interrupted render leaves the shim running. That process still holds <bin>\stems-processor.exe
+# open, and Windows refuses to delete a running image, so the switch would otherwise fail with
+# "being used by another process" forever. Once Engine DJ itself is gone nothing can be using
+# that shim - it only speaks to the app that spawned it - so -Force on the live install ends it.
+function Stop-OrphanShims {
+    if (Get-Process -Name 'Engine DJ' -ErrorAction SilentlyContinue) { return }
+    foreach ($p in @(Get-Process -Name 'stems-processor' -ErrorAction SilentlyContinue)) {
+        if ($WhatIf) {
+            Log 'WHATIF' ("would end the orphaned stems-processor pid {0} (Engine DJ is not running)" -f $p.Id)
+            continue
+        }
+        try {
+            Stop-Process -Id $p.Id -Force -ErrorAction Stop
+            Log 'INFO' ("ended the orphaned stems-processor pid {0} - Engine DJ is not running, so nothing was using it" -f $p.Id)
+        } catch {
+            Log 'WARN' ("could not end stems-processor pid {0}: {1}" -f $p.Id, $_.Exception.Message)
+        }
+    }
+    # let Windows release the image before the rename that follows
+    for ($i = 0; $i -lt 20; $i++) {
+        if (-not (Get-Process -Name 'stems-processor' -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 150
+    }
+}
+
 # The property that actually matters: the app must always find a processor.
 # If a step died halfway, fail back to the stock file rather than to nothing.
 function Repair-Layout([string]$binDir, [string]$stage) {
@@ -474,8 +500,14 @@ if ($running.Count -gt 0) {
         Log 'WARN' ("Engine DJ / stems-processor is running: {0}" -f ($running -join ', '))
         if ($Engine -ne 'status' -and -not $Force) {
             Log 'ERROR' 'close Engine DJ before switching the live install. Or pass -Force if you are sure the file is not locked.'
+            if (-not (Get-Process -Name 'Engine DJ' -ErrorAction SilentlyContinue)) {
+                Log 'ERROR' 'Engine DJ itself is not running, so the stems-processor above is left over from an interrupted render - that process holds the file open. Pass -Force to end it, or end it yourself and try again.'
+            }
             exit 1
         }
+        # -Force: a running shim cannot be deleted, so an orphan has to go first or the restore
+        # is guaranteed to fail. Engine DJ being closed is exactly what makes this safe.
+        if ($Engine -ne 'status') { Stop-OrphanShims }
     } else {
         Log 'INFO' ("Engine DJ is running ({0}) but the target is not the live install - continuing" -f ($running -join ', '))
     }

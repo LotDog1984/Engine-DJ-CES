@@ -108,6 +108,12 @@ against, so an accidental overwrite is always detectable.
 * **Idempotent.** Running the same mode twice is a no-op.
 * **Refuses to guess.** With no recorded baseline it will not assume a file is the original.
 * **Won't run against the live install while Engine DJ is open** unless you pass `-Force`.
+* **`-Force` also ends an orphaned shim.** Engine DJ does not always take its
+  `stems-processor.exe` with it, and a leftover shim still holds the installed file open -
+  Windows refuses to delete a running image, and PowerShell reports that as
+  "Access to the path ... is denied", which used to abort the restore with no visible cause.
+  Once Engine DJ itself is gone nothing can be using that shim, so `-Force` ends it and says so
+  in the log; without `-Force` the refusal now names the leftover process and the fix.
 
 ## The two-step first run
 
@@ -136,6 +142,14 @@ with silence and the reason is logged.
 
 The binary is rebuilt from `shim\StemsShim.cs` (see "Rebuilding"); install it with
 `-Engine custom`, or point at another binary with `-CustomExe <path>`.
+
+The service separates **one job per track at a time**. Two Engine DJ windows - or the retry you
+click because the first job still looks slow - used to run the same track twice, writing the same
+scratch directory and the same stem files, and whichever finished first deleted the other's
+scratch on the way out, so the loser never finished at all while both ran at half speed. The
+second request now waits for the running job and is answered from the render it leaves behind; the
+log says `[queue] ... is already separating ... waiting for that job instead of starting a second
+one`, and `[cache] hit` when it is served. Different tracks still separate in parallel.
 
 ## Limitations worth knowing
 
@@ -167,11 +181,17 @@ The binary is rebuilt from `shim\StemsShim.cs` (see "Rebuilding"); install it wi
 ```
 powershell -ExecutionPolicy Bypass -File stems-lab\tests\test-engine-switch.ps1
 powershell -ExecutionPolicy Bypass -File stems-lab\tests\test-shim-delegation.ps1
+stems-lab\.venv\Scripts\python.exe stems-lab\tests\test-engine-service-concurrency.py
 .\stems-lab\switch-app\StemsEngineSwitch.exe --selftest stems-lab\switch-app\selftest-report.txt
 ```
 
-The third command checks the app's own plumbing headlessly, including the machine-readable
+The last command checks the app's own plumbing headlessly, including the machine-readable
 status it reads (`-Engine status -Json`), and writes a pass/fail report.
+
+The python one needs no models and no audio: it fires three simultaneous requests for the same
+track at the service's request handler and checks that exactly one separation ran, that the
+callers which waited were served from the cache, and that different tracks are still allowed to
+separate at the same time. It fails if the per-track lock is ever removed.
 
 The first runs the switch through every state (adopt, dry run, install, repeat, missing binary,
 restore, round trips, ambiguous state) inside a sandbox with its own state file, and asserts at
@@ -243,6 +263,12 @@ What it does, once:
    That installs everything the service and `separate.py` need: numpy, soundfile, torch,
    torchaudio, demucs, audio-separator, imageio-ffmpeg and onnxruntime. All versions in
    `requirements.txt` are pinned and real on PyPI.
+
+   One caveat that matters for speed: `pip install -r requirements.txt` gets the **CPU** torch
+   build, because that is what PyPI serves. On a machine with an NVIDIA GPU the cu128 wheels in
+   the same file are worth the ~3 GB - expect roughly 2x realtime on CPU (a 3-minute track took
+   about 7 minutes here) against several times faster on the GPU. The service picks the device
+   itself once torch can see it.
 
    `audioread` is pinned there for a reason: `audio-separator` imports it at module level and
    does not declare it, and `librosa` 1.0 — which it does depend on — stopped bringing it in.

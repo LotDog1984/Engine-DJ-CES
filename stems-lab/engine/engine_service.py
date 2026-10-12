@@ -231,6 +231,45 @@ def separate_track(path: pathlib.Path, start: float | None, end: float | None, o
             log(f"[clean] scratch removed, {freed / 1048576:.0f} MB reclaimed ({tmp.name})")
 
 
+_JOB_LOCKS = {}
+_JOB_LOCKS_GUARD = threading.Lock()
+
+
+def job_lock(key: str):
+    """One lock per cache key, made on demand - one small object per separated track."""
+    with _JOB_LOCKS_GUARD:
+        lock = _JOB_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _JOB_LOCKS[key] = lock
+        return lock
+
+
+def cached_result(outdir: pathlib.Path, key: str, name: str) -> dict | None:
+    """The finished render for one cache key, or None when there is not a complete one."""
+    manifest = outdir / "manifest.json"
+    if not manifest.is_file():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        if not all(pathlib.Path(p).is_file() for p in data.get("stems", {}).values()):
+            return None
+    except (ValueError, OSError):
+        return None
+
+    data["cached"] = True
+    data["cache_key"] = key
+    # A hit is use. The shim sweeps renders nothing has written to for hours, so the entry being
+    # served has to look alive or a concurrent job's sweep could delete the very files this
+    # request is about to hand back.
+    try:
+        os.utime(manifest, None)
+    except OSError:
+        pass
+    log(f"[cache] hit for {name} ({key})")
+    return data
+
+
 def handle_separate(req: dict, segment: str | None) -> dict:
     raw = req.get("path")
     if not raw:
@@ -241,38 +280,44 @@ def handle_separate(req: dict, segment: str | None) -> dict:
 
     key = cache_key(path, segment)
     outdir = CACHE_DIR / key
-    manifest = outdir / "manifest.json"
 
-    if manifest.is_file():
-        try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-            if all(pathlib.Path(p).is_file() for p in data.get("stems", {}).values()):
-                data["cached"] = True
-                data["cache_key"] = key
-                # A hit is use. The shim sweeps renders nothing has written to for hours, so the
-                # entry being served has to look alive or a concurrent job's sweep could delete
-                # the very files this request is about to hand back.
-                try:
-                    os.utime(manifest, None)
-                except OSError:
-                    pass
-                log(f"[cache] hit for {path.name} ({key})")
-                return {"ok": True, **data}
-        except (ValueError, OSError):
-            pass
+    hit = cached_result(outdir, key, path.name)
+    if hit is not None:
+        return {"ok": True, **hit}
 
     start = end = None
     if segment:
         a, b = segment.split(":")
         start, end = float(a), float(b)
 
-    log(f"[separate] {path.name} -> {key}")
-    result = separate_track(path, start, end, outdir)
-    result["cache_key"] = key
-    (outdir / "manifest.json").write_text(
-        json.dumps({k: v for k, v in result.items() if k != "cached"}, indent=2), encoding="utf-8"
-    )
-    return {"ok": True, **result}
+    # One separation per cache key at a time. Two Engine DJ windows - or a retry while the first
+    # job still looks slow - would otherwise write the same `_tmp` scratch and the same stem
+    # files, and whichever finished first would delete the other's scratch on the way out. The
+    # loser then never finished at all, and both ran at half speed for sharing the CPU.
+    lock = job_lock(key)
+    if lock.acquire(blocking=False):
+        waited = False
+    else:
+        log(f"[queue] {path.name} is already separating under {key} - waiting for that job instead of starting a second one")
+        lock.acquire()
+        waited = True
+
+    try:
+        if waited:
+            hit = cached_result(outdir, key, path.name)
+            if hit is not None:
+                log(f"[queue] {path.name} was finished by the job we waited for - serving it from cache")
+                return {"ok": True, **hit}
+
+        log(f"[separate] {path.name} -> {key}")
+        result = separate_track(path, start, end, outdir)
+        result["cache_key"] = key
+        (outdir / "manifest.json").write_text(
+            json.dumps({k: v for k, v in result.items() if k != "cached"}, indent=2), encoding="utf-8"
+        )
+        return {"ok": True, **result}
+    finally:
+        lock.release()
 
 
 def serve(host: str, port: int, segment: str | None, stop_event: threading.Event) -> None:
