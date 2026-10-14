@@ -189,6 +189,47 @@ different shape in one run and the recovery was skipped by design (`[stage3] no 
 vocals head`); on both real songs it ran (+1.68 dB Titanium, +2.39 dB Test 1), and the same 4 s tone
 recovered on the next run. Short-input shapes are worth making usable (trim/pad instead of skip).
 
+## The terminal window round (2026-10-14, later)
+
+**Reported:** "why is there a terminal window opening when I started stem generation?"
+
+**Found, and photographed in the act** (a job was running while this was measured, so the window was
+on screen at the time): a Windows Terminal window whose title was the lab's
+`.venv\Scripts\python.exe`, created in the same second as the engine and parented to the shim that
+started it. Cause: `StartOwnProcess` created the engine with `DETACHED_PROCESS` - no console at all -
+but the lab's `.venv\Scripts\python.exe` is a **launcher, not the interpreter**: it re-spawns the
+real python as a *child*, and a console program whose parent has no console gets a brand new one.
+Windows 11 hands that to Windows Terminal, which opens it as a visible window in front of the app.
+
+**Fixed in two places, and they have to ship together:**
+
+| where | change |
+|---|---|
+| `shim/StemsShim.cs` | the engine is created with `CREATE_NO_WINDOW` instead of `DETACHED_PROCESS`: a console that has no window, which its children then inherit instead of creating one |
+| `separate.py` | `audio-separator.exe` is spawned with `CREATE_NO_WINDOW` too - now a *requirement*, not belt-and-braces: once the engine has no console window, an unflagged child is exactly the case that creates one |
+
+The engine also reports it, so the next time this happens it is one line in the log rather than a
+hunt: `[stdio] ... console window=visible|hidden|none` (see `describe_console()`).
+
+**Measured, not assumed** - a scratch lab whose `.venv`, `models` and `.ffmpeg` are junctions to the
+real ones, its own port (51918) so the engine the app was using stayed untouched, and the shim as the
+only difference between the two runs:
+
+| build | engine's own report | end-to-end suite |
+|---|---|---|
+| before (`DETACHED_PROCESS`) | `console window=visible` | 11/11 |
+| after (`CREATE_NO_WINDOW`) | `console window=none` | 11/11 |
+
+Suites re-run after the change, all exit 0: shim/engine handles **9/9**, delegation **12/12**,
+service lifecycle **32/32**, vocals level **14/14**, end-to-end on real audio **11/11**.
+
+**Installed, and re-verified on the installed paths.** The shim went into both the lab and the live
+`bin` (previous builds kept as `stems-processor.exe.window-bug.bak` there), `separate.py` and
+`engine/engine_service.py` into the lab (kept as `*.pre-window-fix.bak`), the engine that had the old
+code in memory was stopped (`{"cmd":"stop"}` -> `[serve] stopped`), and a real job through that pair
+passed **11/11** with the engine logging `console window=none`. The next stem job the app starts
+therefore pops no window.
+
 ## What is already verified
 
 The unknown from last round — Engine DJ's audio framing — came out of your capture and is now

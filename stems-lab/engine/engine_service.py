@@ -155,7 +155,31 @@ def describe_streams() -> str:
             parts.append(f"{name}={'tty' if stream.isatty() else 'not-a-tty'}")
         except Exception:
             parts.append(f"{name}=unknown")
+    parts.append(describe_console())
     return " ".join(parts)
+
+
+def describe_console() -> str:
+    """Whether this process has a console window, and whether that window is on screen.
+
+    The engine is started without any handles and must not put a window in front of whoever is
+    using the app. Neither is free: the lab's `.venv\Scripts\python.exe` is a launcher that
+    re-spawns the real interpreter as a child, and a console program whose *parent* has no console
+    gets a new one - which Windows 11 opens as a visible Windows Terminal window (measured
+    2026-10-14 on a job in progress). `none` and `hidden` are both fine; `visible` is the bug, and
+    this line is what says which one happened, in the engine's own log.
+    """
+    if os.name != "nt":
+        return "console=n/a"
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if not hwnd:
+            return "console window=none"
+        visible = bool(ctypes.windll.user32.IsWindowVisible(hwnd))
+        return f"console window={'visible' if visible else 'hidden'}"
+    except Exception as exc:
+        return f"console window=unknown ({exc.__class__.__name__})"
 
 
 def install_safe_streams(mirror_stdio: bool = False) -> None:

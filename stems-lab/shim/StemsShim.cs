@@ -241,13 +241,21 @@ static class StemsShim
     // the child cannot see, and cannot keep open, anything of ours. It needs nothing from us - it
     // is talked to over loopback - and it logs to engine\engine.log and engine\stdstream.log of its
     // own accord (engine_service.py mirrors anything a library writes to stdout/stderr there).
-    // DETACHED_PROCESS and not CREATE_NO_WINDOW: the latter runs a console application with a
-    // console, only without the window, and python would then find a console on stdout/stderr and
-    // treat them as real streams - writes would go to that invisible console and be lost.
-    // Detached means no console at all, and the service is asked for --mirror-stdio: three NULL
-    // handles are not something to rely on either way, since this machine's python answers
-    // isatty() True for them and would then write a library's output into nothing.
-    const uint DETACHED_PROCESS = 0x00000008;
+    // A hidden console (CREATE_NO_WINDOW) rather than DETACHED_PROCESS, which was the first
+    // choice here and was wrong for a reason that only shows on a real machine: the lab's
+    // `.venv\Scripts\python.exe` is a launcher, not the interpreter, and it re-spawns the real
+    // python as a *child*. A child of a process that has no console at all is a console
+    // application with no console to attach to, so Windows gives it a new one - and on Windows 11
+    // the default terminal host opens that as a visible Windows Terminal window in the middle of
+    // the DJ's screen. Measured 2026-10-14, on a job in progress: the window's title was
+    // `.venv\Scripts\python.exe`, created in the same second as the engine, parented to the shim
+    // that started it. CREATE_NO_WINDOW leaves the engine with a console that has no window, which
+    // its children and grandchildren then *inherit* instead of creating one.
+    //
+    // What that costs: python can see a console on stdout/stderr and treat it as a real stream,
+    // so the service is asked for --mirror-stdio and any library output goes to
+    // engine\stdstream.log instead of an invisible console.
+    const uint CREATE_NO_WINDOW = 0x08000000;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct StartupInfo
@@ -283,10 +291,11 @@ static class StemsShim
         startup.cb = Marshal.SizeOf(typeof(StartupInfo));
         ProcessInformation info;
         // No STARTF_USESTDHANDLES on purpose: the child gets no standard handles rather than
-        // inheriting ours, and no console window either. Its environment is inherited (null
-        // lpEnvironment), which is how STEMS_DEVICE / CUDA_VISIBLE_DEVICES reach it.
+        // inheriting ours, and a console without a window rather than a new visible one. Its
+        // environment is inherited (null lpEnvironment), which is how STEMS_DEVICE /
+        // CUDA_VISIBLE_DEVICES reach it.
         if (!CreateProcess(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false,
-                           DETACHED_PROCESS, IntPtr.Zero, workingDirectory, ref startup, out info))
+                           CREATE_NO_WINDOW, IntPtr.Zero, workingDirectory, ref startup, out info))
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
         try { return info.ProcessId; }
         finally

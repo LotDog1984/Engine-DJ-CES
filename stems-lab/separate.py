@@ -20,6 +20,15 @@ import time
 
 os.environ.setdefault("PYTHONUTF8", "1")
 
+# A console program started by a process that has no console gets a console of its own, and on
+# Windows 11 the default terminal host opens that as a visible window. The engine service runs
+# without a window on purpose (see StartOwnProcess in shim/StemsShim.cs), so audio-separator.exe -
+# a console program - would put a terminal window on screen for every track. CREATE_NO_WINDOW runs
+# it with a console that has no window; its output still goes to a file of its own, see
+# _child_output(). Measured 2026-10-14 on a job in progress: this window was titled
+# `.venv\Scripts\python.exe`, the launcher the engine itself is started through.
+CHILD_FLAGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
 
 def ensure_ffmpeg() -> str | None:
     """Make an ffmpeg binary reachable for engines that shell out to it."""
@@ -117,7 +126,7 @@ def run_audio_separator(wav, sr, model: str, device: str, tmpdir: pathlib.Path):
         env = dict(os.environ)
         env["CUDA_VISIBLE_DEVICES"] = "-1"
     try:
-        subprocess.run(cmd, check=True, stdout=out, stderr=err, env=env)
+        subprocess.run(cmd, check=True, stdout=out, stderr=err, env=env, **CHILD_FLAGS)
     finally:
         if out is not None:
             out.close()
