@@ -24,6 +24,21 @@
 // leftovers by age: input copies after an hour, renders after six. STEMS_KEEP_CACHE=1 /
 // STEMS_KEEP_SESSIONS=1 disable the corresponding deletions and sweeps for debugging.
 //
+// The resident service must not hold the app's pipe ends open, and must not outlive the app.
+// Both were real bugs, reported together on 2026-10-14 after a 13-track batch: Engine DJ would
+// not close. The engine service is started by this shim, so it is a child of a child of the app,
+// and .NET's Process.Start passes bInheritHandles=TRUE *and duplicates this process's standard
+// handles as inheritable ones for the child* - so the service inherited the write end of this
+// session's stdout pipe and kept it open after the shim had exited, and the app never saw the end
+// of the processor's output. Nothing stopped the service either: engine.log for that batch ends
+// without a "[serve] stopped" and engine.port is still lying there.
+//
+// Two things changed. The engine is created with CreateProcess and bInheritHandles=FALSE (see
+// StartOwnProcess) so it cannot see, and cannot keep open, anything of ours; and it is told which
+// process it exists for (--watch-pid, the app that started this shim) so it stops when that app
+// does instead of sitting on a GPU for the rest of the day. See "When the service stops" in
+// README-ENGINE-SWITCH.md, and tests/test-shim-engine-handles.ps1 for the measured evidence.
+//
 // Protocol, as measured:
 //   proc -> app   preparing=initialising\nsession=<token>\n\n
 //   app  -> proc  version=...\nnumChannels=2\nsampleRate=44100\nmaxBlockSize=1024\n...\n
@@ -55,6 +70,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -66,8 +82,9 @@ static class StemsShim
     const int PreviewBytes = 192;
     const string DefaultLab = @"C:\Users\Branko\Desktop\EnginePrime\stems-lab";
 
-    // The engine may come up at any point while the app streams the track, and gets a further
-    // grace period once the audio is in before the session is finished with silence.
+    // How long the engine is given. The app streams at real time, so a cold engine has minutes to
+    // come up while the audio arrives; once the audio is in it gets a further grace period before
+    // the session is finished with silence.
     const int EngineWatchSeconds = 900;
     const int EngineGraceSeconds = 600;
 
@@ -90,6 +107,11 @@ static class StemsShim
     // 200 Hz, pair 2 carries the transients), so a bass stem in the drums slot would mute the
     // wrong thing in the app. Keep this order unless a capture says otherwise.
     static readonly string[] ChannelOrder = { "vocals", "bass", "drums", "other" };
+
+    // The values in use: the constants above unless STEMS_ENGINE_WATCH_SECONDS /
+    // STEMS_ENGINE_GRACE_SECONDS replace them (the test harness shortens both).
+    static int EngineWatch = EngineWatchSeconds;
+    static int EngineGrace = EngineGraceSeconds;
 
     static FileStream logStream;
     static FileStream captureStream;
@@ -201,8 +223,153 @@ static class StemsShim
         Write(s, Encoding.ASCII.GetBytes(text));
     }
 
+    // --------------------------------------------- starting a process that owns nothing ---
+
+    // The engine service may not hold a single handle this process holds, and Process.Start cannot
+    // promise that. It passes bInheritHandles=TRUE and it *duplicates this process's own standard
+    // handles as inheritable ones for the child*, whether or not the streams are redirected and
+    // whatever the handles' own inheritance flags say. Measured 2026-10-14 with a two-process
+    // probe (tests/sandbox/Probe.cs): with HANDLE_FLAG_INHERIT cleared on all three std handles and
+    // read back as cleared, a child started with Process.Start held the write end of the parent's
+    // stdout pipe in every combination tried - redirected streams and not, CreateNoWindow on and off.
+    //
+    // For the engine that is the whole bug: the app waits for the processor's output to end, the
+    // shim exits, and a python process that the shim started is still holding the write end, so it
+    // never ends. On 2026-10-13 a 13-track batch left Engine DJ unable to close for exactly this.
+    //
+    // So the engine is created directly instead, with bInheritHandles=FALSE and no stdio at all:
+    // the child cannot see, and cannot keep open, anything of ours. It needs nothing from us - it
+    // is talked to over loopback - and it logs to engine\engine.log and engine\stdstream.log of its
+    // own accord (engine_service.py mirrors anything a library writes to stdout/stderr there).
+    // DETACHED_PROCESS and not CREATE_NO_WINDOW: the latter runs a console application with a
+    // console, only without the window, and python would then find a console on stdout/stderr and
+    // treat them as real streams - writes would go to that invisible console and be lost.
+    // Detached means no console at all, and the service is asked for --mirror-stdio: three NULL
+    // handles are not something to rely on either way, since this machine's python answers
+    // isatty() True for them and would then write a library's output into nothing.
+    const uint DETACHED_PROCESS = 0x00000008;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct StartupInfo
+    {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput, hStdOutput, hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct ProcessInformation
+    {
+        public IntPtr Process, Thread;
+        public int ProcessId, ThreadId;
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CreateProcess(string application, StringBuilder commandLine, IntPtr processAttributes,
+                                     IntPtr threadAttributes, bool inheritHandles, uint creationFlags,
+                                     IntPtr environment, string currentDirectory,
+                                     ref StartupInfo startup, out ProcessInformation process);
+
+    /// Starts a process that inherits nothing, and returns its pid. Throws when Windows refuses.
+    static int StartOwnProcess(string commandLine, string workingDirectory)
+    {
+        var startup = new StartupInfo();
+        startup.cb = Marshal.SizeOf(typeof(StartupInfo));
+        ProcessInformation info;
+        // No STARTF_USESTDHANDLES on purpose: the child gets no standard handles rather than
+        // inheriting ours, and no console window either. Its environment is inherited (null
+        // lpEnvironment), which is how STEMS_DEVICE / CUDA_VISIBLE_DEVICES reach it.
+        if (!CreateProcess(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false,
+                           DETACHED_PROCESS, IntPtr.Zero, workingDirectory, ref startup, out info))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        try { return info.ProcessId; }
+        finally
+        {
+            if (info.Process != IntPtr.Zero) CloseHandle(info.Process);
+            if (info.Thread != IntPtr.Zero) CloseHandle(info.Thread);
+        }
+    }
+
+    // ----------------------------------------------------------- who started us ---
+
+    // Engine DJ launches one processor per track itself, so this shim's parent is the app, and the
+    // app's pid is exactly the lifetime the engine service needs: as long as the app is up the
+    // engine is wanted, and the moment it is gone the machine should be free again.
+    const uint TH32CS_SNAPPROCESS = 0x00000002;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern bool Process32First(IntPtr snapshot, ref PROCESSENTRY32 entry);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern bool Process32Next(IntPtr snapshot, ref PROCESSENTRY32 entry);
+
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct PROCESSENTRY32
+    {
+        public uint dwSize;
+        public uint cntUsage;
+        public uint th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID;
+        public uint cntThreads;
+        public uint th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExeFile;
+    }
+
+    /// The parent process of `pid` and its name; (0, "") when it cannot be read.
+    static void ParentOf(int pid, out int parentPid, out string parentName)
+    {
+        parentPid = 0;
+        parentName = "";
+        IntPtr snap = IntPtr.Zero;
+        var names = new Dictionary<int, string>();
+        int parent = 0;
+        try
+        {
+            snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return;
+            var entry = new PROCESSENTRY32();
+            entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+            if (!Process32First(snap, ref entry)) return;
+            do
+            {
+                int id = (int)entry.th32ProcessID;
+                names[id] = entry.szExeFile;
+                if (id == pid) parent = (int)entry.th32ParentProcessID;
+            } while (Process32Next(snap, ref entry));
+        }
+        catch { }
+        finally
+        {
+            if (snap != IntPtr.Zero && snap != new IntPtr(-1)) { try { CloseHandle(snap); } catch { } }
+        }
+        parentPid = parent;
+        if (parent != 0) names.TryGetValue(parent, out parentName);
+        if (parentName == null) parentName = "";
+    }
+
     // ------------------------------------------------------------- engine link ---
 
+    // The lab's own engine.port is the authority: it is written by the engine that is serving this
+    // lab, and read here. (The service prefers a fixed port of its own so that a batch cannot
+    // bring up one service per shim, but that number is the service's business - a loser of the
+    // race heals this file - and this side deliberately never guesses it, so two labs on one
+    // machine can never end up serving each other's jobs.)
     static string EnginePort()
     {
         string portFile = Path.Combine(Lab(), "engine", "engine.port");
@@ -215,23 +382,22 @@ static class StemsShim
             && File.Exists(Path.Combine(Lab(), "engine", "engine_service.py"));
     }
 
-    static bool StartEngineService(string reason)
+    static bool StartEngineService(string reason, int watchPid)
     {
         string python = Path.Combine(Lab(), ".venv", "Scripts", "python.exe");
         string service = Path.Combine(Lab(), "engine", "engine_service.py");
         try
         {
-            var psi = new ProcessStartInfo(python);
-            psi.Arguments = "\"" + service + "\"";
-            psi.UseShellExecute = false;
-            psi.CreateNoWindow = true;
-            psi.WorkingDirectory = Lab();
-            psi.RedirectStandardOutput = true;
-            psi.RedirectStandardError = true;
-            Process proc = Process.Start(psi);
-            DrainEngine(proc.StandardOutput.BaseStream, "engine stdout");
-            DrainEngine(proc.StandardError.BaseStream, "engine stderr");
-            Log("started the engine service (" + reason + ") pid " + proc.Id + ": " + service);
+            // Quote() is the escaping the stock processor's arguments get too; both arguments are
+            // paths, so a space in the lab folder is the only thing that has to survive it.
+            string commandLine = Quote(python) + " " + Quote(service) + " --mirror-stdio";
+            if (watchPid > 0)
+                commandLine += " --watch-pid " + watchPid.ToString(CultureInfo.InvariantCulture);
+
+            int pid = StartOwnProcess(commandLine, Lab());
+            Log("started the engine service (" + reason + ") pid " + pid
+                + (watchPid > 0 ? ", watching the app pid " + watchPid : ", no app to watch")
+                + ", inheriting no handles: " + commandLine);
             return true;
         }
         catch (Exception e)
@@ -239,36 +405,6 @@ static class StemsShim
             Log("could not start the engine service: " + e.Message);
             return false;
         }
-    }
-
-    /// A redirected pipe that nobody reads fills up and then blocks the writer, which for the
-    /// engine means its next log line hangs a request. Keep reading, and keep the first few
-    /// kilobytes in the shim log so engine-side tracebacks are not invisible.
-    static void DrainEngine(Stream s, string label)
-    {
-        var t = new Thread(delegate ()
-        {
-            byte[] buf = new byte[4096];
-            var head = new StringBuilder();
-            long total = 0;
-            try
-            {
-                while (true)
-                {
-                    int n = s.Read(buf, 0, buf.Length);
-                    if (n <= 0) break;
-                    total += n;
-                    if (head.Length < 4096) head.Append(Encoding.UTF8.GetString(buf, 0, n));
-                }
-            }
-            catch { }
-            if (head.Length > 0)
-                Log(label + " (first " + head.Length + " of " + total + " bytes): "
-                    + head.ToString().Replace("\r", "\\r").Replace("\n", "\\n"));
-            Log(label + " ended after " + total + " bytes");
-        });
-        t.IsBackground = true;
-        t.Start();
     }
 
     static volatile bool engineReady;
@@ -283,7 +419,7 @@ static class StemsShim
     }
 
     /// Brings the engine up in the background and records the outcome in engineReady/engineWhy.
-    static Thread WatchEngine(int deadlineSeconds)
+    static Thread WatchEngine(int deadlineSeconds, int watchPid)
     {
         var t = new Thread(delegate ()
         {
@@ -304,7 +440,7 @@ static class StemsShim
                 if (!started)
                 {
                     started = true;
-                    StartEngineService(detail);
+                    StartEngineService(detail, watchPid);
                 }
                 if (sw.ElapsedMilliseconds - lastLog > 10000)
                 {
@@ -498,6 +634,15 @@ static class StemsShim
         string env = Environment.GetEnvironmentVariable(name);
         int n;
         return !string.IsNullOrEmpty(env) && int.TryParse(env.Trim(), out n) && n >= 1;
+    }
+
+    /// A whole number of seconds from the environment, or the built-in value.
+    static int EnvSeconds(string name, int fallback)
+    {
+        string env = Environment.GetEnvironmentVariable(name);
+        int n;
+        if (!string.IsNullOrEmpty(env) && int.TryParse(env.Trim(), out n) && n >= 0) return n;
+        return fallback;
     }
 
     static long DirSize(string dir)
@@ -747,8 +892,8 @@ static class StemsShim
         if (!engineReady)
         {
             Log("audio complete, engine not ready yet (" + engineWhy + "); waiting up to "
-                + EngineGraceSeconds + "s");
-            if (watch != null) watch.Join(TimeSpan.FromSeconds(EngineGraceSeconds));
+                + EngineGrace + "s");
+            if (watch != null) watch.Join(TimeSpan.FromSeconds(EngineGrace));
         }
         if (!engineReady)
         {
@@ -993,6 +1138,20 @@ static class StemsShim
             : useEngine ? "engine installed at " + Lab() : "engine not installed at " + Lab();
         Log(useEngine ? "custom mode: " + why : "delegating: " + why);
 
+        EngineWatch = EnvSeconds("STEMS_ENGINE_WATCH_SECONDS", EngineWatchSeconds);
+        EngineGrace = EnvSeconds("STEMS_ENGINE_GRACE_SECONDS", EngineGraceSeconds);
+
+        // The app is this shim's own parent (Engine DJ starts one processor per track), and the
+        // engine service is told to go away with it. Only the log needs the name.
+        int appPid = 0;
+        string appName = "";
+        if (useEngine)
+        {
+            try { ParentOf(Process.GetCurrentProcess().Id, out appPid, out appName); } catch { }
+            Log("started by " + (string.IsNullOrEmpty(appName) ? "an unknown process" : appName)
+                + " pid " + appPid + "; the engine will stop when it does");
+        }
+
         if (!useEngine)
         {
             if (!File.Exists(vendor))
@@ -1010,7 +1169,7 @@ static class StemsShim
         {
             var reader = new MsgReader(Console.OpenStandardInput());
             Stream stdout = Console.OpenStandardOutput();
-            Thread watch = WatchEngine(EngineWatchSeconds);
+            Thread watch = WatchEngine(EngineWatch, appPid);
             int code = RunEngineSession(reader, stdout, Lab(), stamp, watch);
             Log("session return code " + code);
             return code;

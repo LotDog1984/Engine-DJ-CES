@@ -46,6 +46,9 @@ setup-log*.txt
 # Scratch directory tests/test-engine-switch.ps1 builds and leaves behind.
 stems-lab/tests/sandbox/
 
+# The delegation and handle suites build sandboxes of their own and keep them for inspection.
+stems-lab/tests/shim-run/
+
 # Reverse-engineering scratch kept on disk on purpose (PE/ONNX scanners, string dumpers,
 # the disassembly helper) plus the desktop app's project marker. Useful locally, no reason
 # to ship it, so it is untracked here rather than deleted.

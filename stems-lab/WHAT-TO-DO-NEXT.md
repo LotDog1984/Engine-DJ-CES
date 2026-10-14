@@ -28,6 +28,136 @@ powershell -ExecutionPolicy Bypass -File stems-lab\engine-switch.ps1 -Engine ven
 
 `-Engine status` prints which engine is active at any moment.
 
+## The close-hang round (2026-10-14)
+
+**Reported:** after stem separation on 12 tracks, Engine DJ would not close - "something is still
+using the engine".
+
+**Found, from the live lab's own evidence** (`C:\Users\Branko\Desktop\Engine-DJ-CES-master\stems-lab`,
+which is where `engine.json` points):
+
+* `engine/engine.log` for that batch has **two `[serve] listening` lines in the same second**
+  (20:48:31, ports 59352 and 59353). A batch of shims starts in the same instant, every one of them
+  saw "no engine.port yet", and each started a service of its own - two python processes with a full
+  set of models, one of them never used again.
+* Nothing stops a service. That log has **no `[serve] stopped`** and `engine.port` is still lying
+  there: the services were killed, not stopped, and they would have outlived the app for ever.
+* The blocker itself is handle inheritance. The shim starts the service, and .NET's `Process.Start`
+  passes `bInheritHandles=TRUE` *and duplicates the parent's standard handles as inheritable for the
+  child*. Measured with `tests\sandbox\Probe.cs` on 2026-10-14: with `HANDLE_FLAG_INHERIT` cleared on
+  all three std handles (and read back as cleared), a child started through `Process.Start` still
+  held the write end of the parent's stdout pipe - with redirected streams and without them, with
+  `CreateNoWindow` on and off. So the engine held the app's session pipe open after the shim had
+  exited, and Engine DJ waited for the end of a stream that never came.
+
+**Fixed:**
+
+* The shim creates the engine with `CreateProcess` and `bInheritHandles=FALSE` (`StartOwnProcess`),
+  detached and with no stdio: it cannot hold, or even see, anything of the app's. The service is
+  asked for `--mirror-stdio` so library output still lands in `engine\stdstream.log` (python answers
+  `isatty() True` for three NULL handles on this machine - measured - so `isatty()` cannot decide).
+* The service's lifetime is the app's: `--watch-pid <the app>` from the shim, plus an idle exit
+  (60 min) for a service started by hand, plus `STEMS_KEEP_ENGINE=1` to disable both. It stops
+  gracefully and says why.
+* One engine per machine: the service prefers port 51917 and a loser exits after checking that an
+  engine is answering there - without loading anything. The port file is only ever removed when it
+  still holds that service's own port.
+
+**Measured after the fix:** shim handles suite **9/9** (it fails on the old binary - that is the
+regression test), service lifecycle **32/32**, concurrency **8/8**, delegation **12/12**, switch
+**54/54**, and the end-to-end suite **10/10**: a real 4 s track separated through the real models
+("[done] 7.1s (1.77x realtime)", non-silent stems for all 176 400 frames) while the app's pipe
+reached end-of-file with that engine still resident.
+
+**Still to do:** the live install and the lab it points at (`Engine-DJ-CES-master`) still hold the
+old shim and the old service; re-run `-Engine custom` from the folder you want them served from.
+
+## The vocals-level round (2026-10-14)
+
+**Reported:** "on custom engine, vocals are a little bit more quietly then drums, bass and melody —
+match volume level of vocals to track volume just as drums, bass and melody is matched".
+
+**Measured, and the complaint was exact.** Test 1, 60-120 s, our render against the stock engine's
+capture of the same window: drums +0.28 dB, bass +0.39 dB, other +0.52 dB — and **vocals −2.34 dB**.
+Method and the full tables are in `COMPARE.md` ("Vocals level: the cascade was dropping the
+under-estimate"); tools are `tests/stem-level-audit.py` and `tests/stem-vocals-metrics.py`.
+
+**Fixed at the cause, with no gain knob.** The cascade separates `mix − roformer_vocals` with
+htdemucs and then discarded htdemucs' own vocals head on that residual — which is exactly where a
+roformer under-estimate ends up. It is a coherent copy of the vocal (+0.78 correlation with the
+roformer stem, +0.014 with the drum stem), and adding it back puts the stem at the stock engine's
+level (+0.04 dB) and 0.55 dB under the mix on frames where the vocals should equal the mix, against
+3.39 dB without it (the stock engine's own is 1.18 dB under). Nothing else moves, the four stems'
+sum lands closer to the mix, and it costs no extra compute: the head was already there.
+
+`PIPELINE_VERSION` (part of the cache key) was bumped, so renders made by the older pipeline cannot
+be served after this change.
+
+Suites, all exit 0: engine service **32/32**, concurrency **8/8**, shim delegation **12/12**, switch
+**54/54**, shim/engine handles **9/9**, end-to-end on real audio **11/11** (a new check there reads
+the service log for the recovery), plus the new `tests/test-engine-vocals-level.py` **14/14**, which
+stands the two model stages in with synthetic signals and fails 4 of its 14 checks on the pre-fix
+code.
+
+**Still needs the install step.** The engine that runs is the one in the lab `engine.json` points
+at, so until the switch is re-run (`-Engine custom` from *this* repo, Engine DJ closed) the app keeps
+using the older service — quieter vocals included.
+
+## The second report, the same night (2026-10-14)
+
+**Reported:** "I still hear the difference in volume levels from track and vocal stem ... I need you
+to match volume level of vocals to track volume just as drums, bass and melody is matched. I
+downloaded again from github and recreate fresh engine. Did you update the github repo with the
+fix?"
+
+**Nothing since 2026-10-12 was ever committed.** `git log` ends at `be1b4a8` (Oct 12) and that
+commit is what `origin/master` holds, so the repo a fresh download pulls is the Oct 12 code — while
+this working tree carries the whole run of fixes as *uncommitted* changes:
+
+| file | uncommitted | what is in it |
+|---|---:|---|
+| `engine/engine_service.py` | +357 lines | the vocals recovery, one engine per machine, the app-tied lifetime, the queue and cache |
+| `shim/StemsShim.cs`, `shim/stems-processor.exe` | +257 lines, 26624 → 29184 bytes | the close-hang fix: `bInheritHandles=FALSE`, stdout end-of-file while the engine lives |
+
+The recreated engine therefore runs the **Oct 12** build: the live shim log says `custom mode:
+engine installed at ...\Engine-DJ-CES-master\stems-lab` and that lab's `engine.log` has `[stage2]`
+followed by `[done]` with **no `[stage3]`** — the recovery never runs there. That is the whole of
+"still quieter": what is running is the pre-fix pipeline, on both counts (the level and the hang).
+
+**The app's own stem files cannot be measured** (so this round audited renders, not the library).
+`Music\Engine Library\Stems\<trackId> <uuid>.stems` is one 8-channel AAC MP4 per track — but the
+payload is not readable: ffmpeg decodes 0.02-0.28 s of a 3-minute file and reports 2944 `Error
+submitting packet to decoder`, 1408 `Reserved bit set`, 1096 `Prediction is not allowed in AAC-LC`.
+Engine DJ only plays those through its own decoder, so the stems a listener hears have to be
+reproduced with a render rather than read out of the library.
+
+**Measured on the files you separate, not on a lab excerpt.** `tests/stem-song-level.py` renders a
+window of any song through `engine_service.separate_track()` itself — once with the recovery and
+once with `add_vocals_leftover()` disabled — and scores each stem on the frames where that stem is
+alone in the mix (0 dB = the stem sits at the mix's level there). Titanium remix, 60-120 s:
+
+| stem | rms before | rms after | change | alone-frames before | after |
+|---|---:|---:|---:|---:|---:|
+| vocals | −24.36 | −22.68 | **+1.68** | −4.20 | −2.30 |
+| drums | −16.83 | −16.85 | −0.01 | −0.29 | −0.29 |
+| bass | −15.33 | −15.34 | −0.00 | −0.50 | −0.48 |
+| other | −19.52 | −19.51 | +0.01 | −4.67 | −4.48 |
+
+Four stems' sum vs the mix: level −0.16 → **−0.00 dB**, residual −21.1 → −23.5 dB.
+
+**And the leftover ~2 dB is not ours to remove.** An independent separator, `htdemucs_ft` on the
+*full* mix, puts the same window's vocals at −22.60 dB and −2.52 dB on those alone-frames; our fixed
+stem is −22.68 dB and −2.30 dB — i.e. within **0.08 dB** of the reference in level and *better* on
+the alone-frames, with +0.961 correlation. Both models sit ~2 dB under the mix there because that is
+what vocal separation does at these frames, not because the stem is quiet: drums and bass score
+near 0 dB only because they are the loudest thing in the mix whenever they play. Adding a gain on
+top of that would be a taste trim on the mix's own balance, and it would break the four-stems-sum
+property measured above.
+
+**What is left is the install, not the engine.** Copy this `engine_service.py` over the lab's, or
+re-run `-Engine custom` from this repo with Engine DJ closed; and *commit* the two files so the next
+download is not Oct 12 again.
+
 ## What is already verified
 
 The unknown from last round — Engine DJ's audio framing — came out of your capture and is now

@@ -102,6 +102,98 @@ Cost is ~0.24× realtime, i.e. a 5-minute track in about 70 s on this GPU.
 If you want a smaller machine footprint, `htdemucs_ft` alone is still a large step up from
 the shipped engine — but the percussion bleed into vocals stays.
 
+## Vocals level: the cascade was dropping the under-estimate (2026-10-14)
+
+**Reported:** on the custom engine, vocals sound a little quieter than drums, bass and melody.
+
+**Measured** on Test 1, 60-120 s, both renders of that same window and the same source
+([tests/stem-level-audit.py](tests/stem-level-audit.py); stock = the 2026-10-09 capture decoded per
+stem, custom = a `--once` separation of the same window):
+
+| stem | stock | custom before | custom after | after − stock |
+|---|---:|---:|---:|---:|
+| vocals | −19.60 | −21.94 | **−19.56** | **+0.04 dB** |
+| drums | −17.06 | −16.74 | −16.78 | +0.28 |
+| bass | −24.24 | −24.01 | −23.86 | +0.39 |
+| other | −21.58 | −21.07 | −21.06 | +0.52 |
+| sum vs mix | −24.0 dB error, −0.19 dB level | −14.5 dB, −0.69 dB | −17.1 dB, −0.15 dB | — |
+
+That is the complaint exactly: the other three stems sat within 0.5 dB of the stock engine, and
+vocals sat 2.34 dB under it.
+
+**Cause, not a gain setting.** The cascade removes the roformer's vocals from the mix, hands
+`mix − vocals` to htdemucs, and then threw htdemucs' **vocals** head on that residual away. That
+head is where a roformer under-estimate goes, and the measurements say so
+([tests/stem-vocals-metrics.py](tests/stem-vocals-metrics.py), same window):
+
+| candidate | vocals rms | vs stock | HF share >6 kHz | a cappella | kick/snare frames |
+|---|---:|---:|---:|---:|---:|
+| stock | −19.60 | 0.00 | 0.021 | −1.18 dB | −1.77 dB |
+| roformer alone | −21.94 | −2.34 | 0.017 | −3.39 dB | −3.93 dB |
+| roformer + the residual's vocals head | **−19.58** | **+0.02** | 0.015 | **−0.55 dB** | −4.97 dB |
+| mix (reference) | −13.02 | — | 0.010 | 0 dB | — |
+
+* "a cappella" is the vocals stem's level against the mix on frames where that stem's own
+  accompaniment is quietest and the mix is not silent — where a correct vocals stem should equal
+  the mix. The stock engine's own vocals sits 1.18 dB under; ours alone was 3.39 dB under; with the
+  head added it is 0.55 dB under, i.e. closer to the truth than the reference render is.
+* The leftover is that signal, not bleed: correlation **+0.78** with the roformer stem, +0.487 with
+  the mix, **+0.014** with the stock drum stem — and adding it leaves the vocals *quieter* on
+  kick/snare frames (−4.97 dB vs −3.93 dB), with an HF share that moves toward the mix's 0.010.
+* So no user-facing gain and no vendor level is copied: the energy was being thrown away, and it
+  happens to land the stem on the stock render's level (+0.02 dB) because both are the same vocal.
+* It costs nothing: htdemucs had already computed that head; it was dropped one line later. The
+  four stems' sum also moves *closer* to the mix (last row), since the recovered energy is no
+  longer missing from the render.
+
+`PIPELINE_VERSION` in `engine/engine_service.py` is part of the cache key and was bumped, so a
+render made by the older pipeline is never served after this change.
+
+## The same vocal, on your own songs, against an independent separator (2026-10-14)
+
+Test 1 is a lab excerpt; the report came from real tracks, so the same question was measured on one
+of them. `tests/stem-song-level.py` renders a window through `engine_service.separate_track()`
+itself — once with the recovery, once with `add_vocals_leftover()` disabled — and scores every stem
+on the frames where that stem is alone in the mix (its own accompaniment at its quietest, mix not
+silent). 0 dB means the stem sits at the mix's level on the frames where the mix is that stem.
+
+Titanium (David Guetta & Morten Future Rave Remix feat. Sia), `--start 60 --end 120`:
+
+| stem | rms before | rms after | change | alone vs mix, before | after |
+|---|---:|---:|---:|---:|---:|
+| vocals | −24.36 | −22.68 | **+1.68** | −4.20 | −2.30 |
+| drums | −16.83 | −16.85 | −0.01 | −0.29 | −0.29 |
+| bass | −15.33 | −15.34 | −0.00 | −0.50 | −0.48 |
+| other | −19.52 | −19.51 | +0.01 | −4.67 | −4.48 |
+| four stems' sum vs mix | level −0.16 dB, residual −21.09 dB | **−0.00 dB, −23.46 dB** | | | |
+
+The recovered signal is −9.73 dB against the roformer's own vocals stem, correlation **+0.562**.
+
+**An independent separator agrees with the result, not with the gap.** `htdemucs_ft` run on the
+*full* mix (not on the residual) for the same window, in the same frame metric:
+
+| candidate | rms | alone vs mix | HF share >3 kHz | spectral centroid |
+|---|---:|---:|---:|---:|
+| mix (the track) | −11.44 | 0.00 | 0.047 | 503 Hz |
+| htdemucs_ft on the full mix | −22.60 | −2.52 | 0.271 | 2164 Hz |
+| ours, stage 1 only | −24.36 | −4.20 | 0.265 | 2220 Hz |
+| ours, fixed | **−22.68** | **−2.30** | 0.244 | 2028 Hz |
+
+Our fixed vocals stem is **0.08 dB** from the reference separator's level and 0.22 dB *better* on the
+alone-frames (correlation +0.961), so the ~2 dB it keeps under the mix is what vocal separation does
+at those frames — both models show it — and not a level our pipeline is holding back. Drums and bass
+sit near 0 dB only because they are the loudest element in the mix whenever they play. The remaining
+levers, in order of honesty: install the fix (this table's "after" column), or accept a taste trim
+on top of the mix's own balance, which necessarily pushes the four stems' sum above the mix where
+the vocals play.
+
+**Why the app's own stem files are not the reference here.** Engine DJ stores each separated track
+as `<Music>\Engine Library\Stems\<trackId> <uuid>.stems`, an 8-channel AAC MP4 (channel order
+vocals, bass, drums, other). It is not readable outside the app: ffmpeg gets 0.02–0.28 s out of a
+3-minute file, with 2944 `Error submitting packet to decoder`, 1408 `Reserved bit set` and 1096
+`Prediction is not allowed in AAC-LC` — the payload is not plain AAC-LC. So the four stems a
+listener hears have to be reproduced by a render, which is what the tables above do.
+
 ## Next step: putting it inside Engine DJ (not done yet)
 
 1. **Relay capture** — a logging proxy is built and tested in [`relay/`](relay)

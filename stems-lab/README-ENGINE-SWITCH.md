@@ -133,8 +133,10 @@ against, so an accidental overwrite is always detectable.
 `stems-lab\shim\stems-processor.exe` (source: `shim\StemsShim.cs`) is the real engine: it speaks
 the host's stdio protocol itself and hands each job to the resident service
 (`engine\engine_service.py`), which runs the cascade measured in `COMPARE.md` — vocals from
-`vocals_mel_band_roformer`, then `htdemucs_ft` on the residual, so the four stems still sum to
-the mix.
+`vocals_mel_band_roformer`, then `htdemucs_ft` on the residual, plus htdemucs' own vocals head on
+that residual, which is where the roformer's under-estimate lands (the 2026-10-14 level fix: that
+head used to be dropped and the vocals stem came out 2.3 dB under the other three). The four stems
+still sum to the mix.
 
 The stock processor is no longer on the separation path, but it is still the safety net: if the
 engine is missing, cannot start, or cannot serve the job, the shim delegates to
@@ -184,7 +186,10 @@ one`, and `[cache] hit` when it is served. Different tracks still separate in pa
 ```
 powershell -ExecutionPolicy Bypass -File stems-lab\tests\test-engine-switch.ps1
 powershell -ExecutionPolicy Bypass -File stems-lab\tests\test-shim-delegation.ps1
+powershell -ExecutionPolicy Bypass -File stems-lab\tests\test-shim-engine-handles.ps1
 stems-lab\.venv\Scripts\python.exe stems-lab\tests\test-engine-service-concurrency.py
+stems-lab\.venv\Scripts\python.exe stems-lab\tests\test-engine-service-lifecycle.py
+powershell -ExecutionPolicy Bypass -File stems-lab\tests\test-engine-end-to-end.ps1
 .\stems-lab\switch-app\StemsEngineSwitch.exe --selftest stems-lab\switch-app\selftest-report.txt
 ```
 
@@ -205,6 +210,25 @@ when the stock binary is missing.
 
 Both exit `0` only if every check passes.
 
+The handle one plays the app for two sessions in a sandbox whose ".venv" holds a compiled sleeper
+instead of python: it starts the shim with redirected stdio, drives a session, and then asks the
+question that was the 2026-10-14 bug - after the shim is gone, and while the process it started is
+still alive, does the shim's stdout reach end-of-file? It also checks the sleeve the engine is
+asked to watch (`--watch-pid`) is the app's own pid. It needs no venv, models or audio, and it is
+the one suite that fails on a pre-fix `stems-processor.exe`, which is how the fix was measured.
+
+The lifecycle one runs the real service as a subprocess and checks the rules in the section above:
+a second service on the same port exits without loading anything, a service whose app has gone
+stops by itself, an idle one does too, a job in flight is given a moment before the process ends,
+and a port file that is no longer the service's own is left alone. It needs no models and no audio.
+
+The end-to-end one is the only automated job through the real engine: it streams a 4 s track the way
+the app does, lets the shim bring the service up (no inherited handles at all), and checks four stems
+come back, that every input frame is returned, that the returned stream is audio rather than the
+silence fallback, and that the app's pipe reached end-of-file while that engine was still resident.
+It needs the venv and the vocal model - it skips with exit 0 and says so when they are not there -
+and takes about a minute on a GPU.
+
 ## Nothing is left behind
 
 A finished job cleans up after itself: once every stem of the track has gone back to Engine DJ
@@ -224,6 +248,45 @@ the size reclaimed.
 
 After a normal track the scratch folders are empty: a 6-minute track no longer parks 130-260 MB
 in `engine\cache\` forever.
+
+## When the engine stops
+
+The engine is a resident process, so it has to know when it is no longer wanted. Two rules, and
+both are about the machine rather than the job:
+
+* **It lives with the app.** The shim is Engine DJ's own child and hands the app's pid to the engine
+  when it starts it (`--watch-pid`); the service stops when that process is gone. Nothing used to
+  stop it at all: on 2026-10-13 a 13-track batch left a running python holding a full set of models
+  long after Engine DJ had been closed, with `engine.port` still lying next to it.
+* **It stops when nobody asks it anything** for `--idle-exit-minutes` (60 by default). That is the
+  fallback for a service started by hand, with no app to watch. `STEMS_KEEP_ENGINE=1` disables both
+  rules for a debugging run.
+
+A stop is orderly: the port file goes, a job already in flight gets up to 30 s to finish, and the
+log says why it happened (`the app this engine was started for (pid N) is gone`, `idle for N min`,
+`asked to stop`). While it is up it is also the only one on the machine: the service prefers port
+51917, and a second service that cannot take it checks that an engine is answering there and exits
+without loading anything. Before that rule, a batch of shims starting in the same instant each
+brought up a service of their own - that batch left two, and `engine/engine.log` shows it as two
+`[serve] listening` lines in one second.
+
+The engine also has to hold nothing that belongs to the app:
+
+* **Handles.** `shim\StemsShim.cs` creates it with `CreateProcess` and `bInheritHandles=FALSE`
+  (`StartOwnProcess`), so it inherits no handles at all - not the app's pipes, not its own stdio.
+  `Process.Start` cannot promise that: it passes `bInheritHandles=TRUE` *and* duplicates this
+  process's standard handles as inheritable ones for the child, whatever their flags say (measured;
+  see `tests\test-shim-engine-handles.ps1`). That inheritance is what made Engine DJ refuse to
+  close after that batch: the shim had exited, and a python it had started was still holding the
+  write end of the session's stdout pipe, so the app waited for the end of a stream that never
+  came.
+* **One process, not a family.** The child is created detached (`DETACHED_PROCESS`), so it has no
+  console either, and it is asked for `--mirror-stdio`: anything a library writes to stdout/stderr
+  is appended to `engine\stdstream.log` instead of going nowhere. Measured on this machine: python
+  answers `isatty() True` for three NULL handles, so this cannot be left to `isatty()` alone.
+
+A second lab (or a test) on the same machine keeps its own port, log and renders with
+`STEMS_PORT_FILE`, `STEMS_LOG_FILE`, `STEMS_STREAM_LOG` and `STEMS_CACHE_DIR`.
 
 ## Rebuilding
 
@@ -355,6 +418,9 @@ at runtime from the repo:
 | `stems-lab\requirements.txt` | pinned deps to rebuild `.venv` |
 | `stems-lab\tests\test-engine-switch.ps1` | switch harness |
 | `stems-lab\tests\test-shim-delegation.ps1` | shim delegation harness |
+| `stems-lab\tests\test-shim-engine-handles.ps1` | the engine's handle rule, measured |
+| `stems-lab\tests\test-engine-service-lifecycle.py` | the engine's lifetime rules |
+| `stems-lab\tests\test-engine-end-to-end.ps1` | one real job through the real engine |
 | `stems-lab\stem-player\` | the local stem auditioner |
 | `stems-lab\tools\`, `stems-lab\disasm.txt` | notes and scripts from the stock-binary analysis |
 | `stems-lab\*.md` | this file and the lab's notes |
