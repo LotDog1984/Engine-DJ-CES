@@ -1085,6 +1085,11 @@ static class StemsShim
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
         psi.WorkingDirectory = dir;
+        // The stock processor is a console program and this shim has no console of its own (Engine
+        // DJ starts it with redirected pipes), so without this the fallback would open a console
+        // window of its own - a job that never reaches the engine would pop a terminal in front of
+        // the app. It writes to the pipes it is given either way.
+        psi.CreateNoWindow = true;
 
         Process child;
         try { child = Process.Start(psi); }

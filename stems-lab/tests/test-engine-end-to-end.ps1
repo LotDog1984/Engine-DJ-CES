@@ -7,11 +7,14 @@ the way the app does (planar float32, 1024 frames per message), lets the shim st
 service, and checks a real separation comes back - through the model load, the cascade, and the
 mirroring of the four stems into 8 channels.
 
-It is also the only automated check of two things only the real thing can show:
+It is also the only automated check of the things only the real thing can show:
 
   * the service is started with bInheritHandles=FALSE (StartOwnProcess in shim\StemsShim.cs) and
     still separates. That start gives the child no handles at all, so it is worth re-measuring
     whenever the start path changes.
+  * that same start leaves the engine without a console *window* - the pop-up of 2026-10-14 - which
+    the engine reports itself (`[stdio] ... console window=`). test-console-window.py covers the
+    spawn one level below this one; this is the only place that covers the shim's own start.
   * the app's read on the processor's stdout still reaches end-of-file while that engine is alive.
     That is the 2026-10-14 bug (Engine DJ would not close) in its original form.
   * the cascade's stage 3 runs on real models: the vocals under-estimate that htdemucs finds in
@@ -171,6 +174,19 @@ if ($engineWasRunning) {
 } else {
     $gain = if ($recovered.Success) { [double]$recovered.Groups[1].Value } else { 0.0 }
     Check 'the vocals under-estimate was recovered into the vocals stem' ($recovered.Success -and $gain -gt 0.2) $tail
+}
+
+# ...and, in the same start, no window in front of whoever is using the app. This is the 2026-10-14
+# pop-up: the shim starts the engine with no console at all, a console program whose parent has none
+# is given a new one, and Windows 11 opens that as a visible Windows Terminal window - during a job,
+# and for as long as the resident engine lives after it. The engine reports which it got, in one line
+# of its own log, so this needs no window census and cannot go stale. The depth below this one (the
+# engine's own child, audio-separator.exe) is covered by test-console-window.py.
+$consoleReport = [regex]::Match($tail, '\[stdio\][^\r\n]*console window=(none|hidden|visible)')
+if ($engineWasRunning) {
+    Write-Host '  note  an engine was already up before this run, so its start (and its console) is not in this tail' -ForegroundColor DarkGray
+} else {
+    Check 'the engine was started without a window of its own' ($consoleReport.Success -and $consoleReport.Groups[1].Value -ne 'visible') $tail
 }
 
 # The 2026-10-14 bug: the shim is gone, the engine it started is not, and the app must still see the

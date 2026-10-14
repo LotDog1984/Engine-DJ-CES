@@ -181,6 +181,17 @@ one`, and `[cache] hit` when it is served. Different tracks still separate in pa
   Engine DJ speaks something else, the shim's log will show it and `-Engine vendor` is one
   click away.
 
+* **A job must never put a console window on screen, and that is a property of how each process is
+  started.** The processor Engine DJ spawns is a console program started with pipes, the shim starts
+  the engine service, and the engine spawns `audio-separator.exe` for the vocal model. Any one of
+  those started without `CREATE_NO_WINDOW` while its parent has **no console** is given a console of
+  its own, and Windows 11 opens that as a visible Windows Terminal window - during the job, and for
+  as long as the resident engine lives after it (which is why the windows can outlive the render).
+  The engine says which it got in its first log line: `[stdio] ... console window=none` is right,
+  `visible` is the pop-up. `tests\test-console-window.py` measures the child side of it and
+  `tests\test-engine-end-to-end.ps1` the shim's own start, so a rebuilt shim with the wrong creation
+  flags fails a suite instead of opening a window in the app.
+
 ## Verifying it yourself
 
 ```
@@ -189,12 +200,18 @@ powershell -ExecutionPolicy Bypass -File stems-lab\tests\test-shim-delegation.ps
 powershell -ExecutionPolicy Bypass -File stems-lab\tests\test-shim-engine-handles.ps1
 stems-lab\.venv\Scripts\python.exe stems-lab\tests\test-engine-service-concurrency.py
 stems-lab\.venv\Scripts\python.exe stems-lab\tests\test-engine-service-lifecycle.py
+stems-lab\.venv\Scripts\python.exe stems-lab\tests\test-console-window.py
 powershell -ExecutionPolicy Bypass -File stems-lab\tests\test-engine-end-to-end.ps1
 .\stems-lab\switch-app\StemsEngineSwitch.exe --selftest stems-lab\switch-app\selftest-report.txt
 ```
 
 The last command checks the app's own plumbing headlessly, including the machine-readable
 status it reads (`-Engine status -Json`), and writes a pass/fail report.
+
+The console-window one needs nothing but a python: it runs separate.py's own spawn decision for a
+probe child, from a parent with no console, and checks the child reports no window. It pops nothing
+unless you pass `--show-window`, which runs the same spawn with the flag dropped and asserts the
+window that appears - the only way to show the suite can fail.
 
 The python one needs no models and no audio: it fires three simultaneous requests for the same
 track at the service's request handler and checks that exactly one separation ran, that the

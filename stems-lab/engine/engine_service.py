@@ -412,10 +412,16 @@ def separate_track(path: pathlib.Path, start: float | None, end: float | None, o
 
         # What the roformer under-estimated ends up in htdemucs' vocals head on the residual; it
         # is part of the vocals stem, not waste (see add_vocals_leftover).
-        vocals, recovered = add_vocals_leftover(vocals, inst_stems.get("vocals"))
+        head = inst_stems.get("vocals")
+        vocals, recovered = add_vocals_leftover(vocals, head)
         if recovered is None:
-            log("[stage3] no usable residual vocals head (missing, or a different shape from the "
-                "roformer's) - the vocals stem stays as stage 1 left it")
+            # Say which of the two it is, and both shapes: "no usable head" on its own cost a
+            # reproduction round when a 4 s tone was seen to hit this and nothing else did.
+            detail = ("missing" if head is None else
+                      f"shape {tuple(head.shape)} where the roformer's is {tuple(vocals.shape)}, "
+                      f"{head.dtype} vs {vocals.dtype}")
+            log(f"[stage3] no usable residual vocals head ({detail}) - the vocals stem stays as "
+                "stage 1 left it")
         else:
             log(f"[stage3] vocals +{recovered:.2f} dB recovered from the residual")
 

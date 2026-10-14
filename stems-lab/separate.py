@@ -117,6 +117,12 @@ def run_audio_separator(wav, sr, model: str, device: str, tmpdir: pathlib.Path):
     except OSError:
         pass  # a caller whose stdout is gone must not turn a diagnostic into a failure
     out, err = _child_output(tmpdir)
+    # CREATE_NO_WINDOW only when the child's output is redirected to a file. A child that inherits
+    # this process's *console* handles must not be given a console of its own: those handles are
+    # then invalid inside it, and audio-separator dies with exit 1 and no message (measured
+    # 2026-10-14 by running this function from a console). With the redirect there is nothing to
+    # inherit, and the flag is exactly what keeps the window away from a windowless parent.
+    flags = CHILD_FLAGS if out is not None else {}
     env = None
     if device and device.lower().startswith("cpu"):
         # audio-separator has no device flag and would pick the GPU itself; hiding the GPU from
@@ -126,7 +132,7 @@ def run_audio_separator(wav, sr, model: str, device: str, tmpdir: pathlib.Path):
         env = dict(os.environ)
         env["CUDA_VISIBLE_DEVICES"] = "-1"
     try:
-        subprocess.run(cmd, check=True, stdout=out, stderr=err, env=env, **CHILD_FLAGS)
+        subprocess.run(cmd, check=True, stdout=out, stderr=err, env=env, **flags)
     finally:
         if out is not None:
             out.close()

@@ -11,7 +11,7 @@ install:
 
 | file in `%LOCALAPPDATA%\AIR Music Technology\EnginePrime\bin` | what it is |
 |---|---|
-| `stems-processor.exe` (24 KB, `41b30700…`) | the shim Engine DJ spawns; it speaks the host's protocol and answers with stems from the engine |
+| `stems-processor.exe` (29184 bytes, `385f3166…`) | the shim Engine DJ spawns; it speaks the host's protocol and answers with stems from the engine |
 | `stems-processor.vendor.exe` (396 MB, `e416e195…`) | your original processor, byte-identical to how it shipped |
 | `NNPredictionDispatcher_on.dll` | untouched |
 
@@ -201,7 +201,7 @@ but the lab's `.venv\Scripts\python.exe` is a **launcher, not the interpreter**:
 real python as a *child*, and a console program whose parent has no console gets a brand new one.
 Windows 11 hands that to Windows Terminal, which opens it as a visible window in front of the app.
 
-**Fixed in two places, and they have to ship together:**
+**Fixed in the two spawn sites that existed then, and they have to ship together:**
 
 | where | change |
 |---|---|
@@ -229,6 +229,74 @@ service lifecycle **32/32**, vocals level **14/14**, end-to-end on real audio **
 code in memory was stopped (`{"cmd":"stop"}` -> `[serve] stopped`), and a real job through that pair
 passed **11/11** with the engine logging `console window=none`. The next stem job the app starts
 therefore pops no window.
+
+### Part 2: the pop-ups after your batch (same day, later)
+
+**Reported again:** terminal windows appeared during a batch, and more after the job had finished.
+
+**They were the old build, and the timestamps say so rather than my memory.** The fix went into the
+live `bin` at **17:35:23** (`stems-processor.exe.window-bug.bak` is the file it replaced, and that is
+its mtime); the five jobs of that batch ran **17:29:54–17:32:02** (`bin\stems-shim-*.log`, five
+sessions, all `custom mode`, `session return code 0`). The engine that served them had started at
+17:27:10 and is the one whose `[stdio]` line carries **no** `console window=` field at all - the
+engine code that logs it only landed at 17:35:23 with the rest of the fix - and it stayed resident
+until 17:35:29, which is exactly why windows were still there *after* the render: a window opened by
+a resident engine lives as long as that engine does.
+
+**One site was still genuinely unfixed, and is fixed now:** the shim's fallback to the stock
+processor (`Delegate`) started `stems-processor.vendor.exe` with `Process.Start` and no
+`CreateNoWindow`. The stock processor is a console program and the shim itself is started with
+redirected pipes (so it may have no console), so a job that fell back to the vendor engine would
+have popped one window per track. It now sets `psi.CreateNoWindow = true`; the child is unaffected
+because both of its streams are pipes the shim owns.
+
+**The matrix, measured with a probe that reports its own console** (`tests/console-spawn.py` running
+`tests/console-probe.py`, which prints `engine_service.describe_console()` - the same words the
+engine logs):
+
+| parent process | `CREATE_NO_WINDOW` on the child | child reports |
+|---|---|---|
+| hidden-console engine (as the shim starts it) | yes | `console window=none` |
+| hidden-console engine | no | `console window=none` (it *inherits* that console) |
+| console-less parent (`DETACHED_PROCESS`) | yes | `console window=none` |
+| console-less parent | no | `console window=visible` - the pop-up |
+
+So `CHILD_FLAGS` in `separate.py` is what stands between a console-less engine and one window per
+track, and the last row is how the check was shown to be able to fail.
+
+**New suite** `tests/test-console-window.py`: 5 checks, no models, no venv packages, pops nothing by
+default (the window-popping control row is behind `--show-window`, which asserts `visible`).
+Sensitivity proved by mutation, not by inspection: with `CHILD_FLAGS` set to `{}` the suite reports
+`FAIL ... [console window=visible]` and exits 1; restored byte-identical (md5 `4b644dc2…`), 5/5
+again. `tests/test-engine-end-to-end.ps1` gained the other hop as a check of its own - `the engine
+was started without a window of its own`, read from the engine's `console window=` line for the run
+- so a shim rebuilt with the wrong creation flags fails the suite instead of popping a window in
+the app.
+
+Suites after this round, all exit 0: console window **5/5** (and **6/6** with the control),
+end-to-end on real audio **12/12**, shim/engine handles **9/9**, delegation **12/12**, switch
+**54/54**, service lifecycle **32/32**, concurrency **8/8**, vocals level **14/14**. The installed
+pair was re-verified through the paths the app uses (`tests/patch-e2e-live.py` + the live `bin`
+shim): **12/12**, engine logged `console window=none`, engine stopped afterwards, no port file and
+no stray process left behind.
+
+**What is installed now** (live `bin` and the lab, byte-identical to this repo's files - md5 checked,
+not assumed):
+
+| file | md5 | previous version kept as |
+|---|---|---|
+| `bin\stems-processor.exe`, `…\stems-lab\shim\stems-processor.exe` | `385f3166…` (29184 bytes) | `…pre-delegate-fix.bak` (this round), `…window-bug.bak`, `…pre-20261014-fix.bak` |
+| `…\stems-lab\separate.py` | `4b644dc2…` | `separate.py.pre-window-fix.bak` |
+| `…\stems-lab\engine\engine_service.py` | `bd2e54e2…` | `engine_service.py.pre-window-fix.bak` |
+
+Those three `.bak` files in `bin` are this work's leftovers and are safe to delete whenever you
+like; nothing reads them.
+
+**Open, carried forward:** in one of four 4-second-tone runs the stage-3 recovery was skipped
+(`no usable residual vocals head`) and the vocals stem stayed at the roformer's level - about 2 dB
+low. It did not reproduce in three later runs and every suite since has recovered. The log line now
+names which of the two causes it was (`missing` vs `a different shape (…)`), so the next occurrence
+is one line to read instead of a hunt; the real songs in the app have recovered every time.
 
 ## What is already verified
 
