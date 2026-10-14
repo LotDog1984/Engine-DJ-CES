@@ -154,9 +154,40 @@ near 0 dB only because they are the loudest thing in the mix whenever they play.
 top of that would be a taste trim on the mix's own balance, and it would break the four-stems-sum
 property measured above.
 
-**What is left is the install, not the engine.** Copy this `engine_service.py` over the lab's, or
-re-run `-Engine custom` from this repo with Engine DJ closed; and *commit* the two files so the next
-download is not Oct 12 again.
+**Committed and pushed (`ec9008b`).** Verified as a *download*, not as a push: GitHub's ZIP of
+`master` now contains `add_vocals_leftover`, `PIPELINE_VERSION = "3"`, `bInheritHandles` in the shim
+source and the 29184-byte shim binary, so a fresh clone + first-run setup is current from here on.
+
+**Installed, and verified through the installed paths.** Two files changed on the machine, each with
+its previous version kept beside it:
+
+| what | now | previous kept as |
+|---|---|---|
+| `%LOCALAPPDATA%\...\EnginePrime\bin\stems-processor.exe` | the 29184-byte build, md5 `572b05f2…` | `stems-processor.exe.pre-20261014-fix.bak` |
+| `…\Engine-DJ-CES-master\stems-lab\engine\engine_service.py` | this repo's file, byte-identical | `engine_service.py.pre-vocals-fix.bak` |
+
+`engine.json` still points at `Engine-DJ-CES-master\stems-lab`, and the resident engine that had the
+old module in memory was retired (`{"cmd":"stop"}` → `[serve] stopped`, port file gone), so the next
+stem job in the app starts the fixed service.
+
+**Measured through those exact paths** — `tests/sandbox/e2e-oldshim.ps1`, a copy of the end-to-end
+suite with `$Shim` pointing at the live install's binary and `$LabRoot` at that lab:
+
+| pair | result |
+|---|---|
+| live shim **before** this round (Oct 12 binary) + fixed service | **6 passed, 5 failed** |
+| live shim **as installed now** + fixed service | **11 passed, 0 failed** |
+
+The five failures in the first row are one cause, not five: the Oct 12 shim never closes the app's
+pipe, and the harness reads the payload only after end-of-file (`$payload = $(if ($eof) {...} else
+{''})`), so "frames came back", `done=true` and "stem audio, not silence" all fall with the EOF check
+they descend from. That is the close-hang bug reproducing on the installed pair, and it is the shim
+side of this round, not the service side.
+
+**One open point, not hidden:** on a 4 s synthetic tone the residual's vocals head came back a
+different shape in one run and the recovery was skipped by design (`[stage3] no usable residual
+vocals head`); on both real songs it ran (+1.68 dB Titanium, +2.39 dB Test 1), and the same 4 s tone
+recovered on the next run. Short-input shapes are worth making usable (trim/pad instead of skip).
 
 ## What is already verified
 
